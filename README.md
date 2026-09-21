@@ -29,3 +29,6 @@ Python 3.10 以上と Node.js 22 以上が入っている必要がある。
 `npm test` は公開サンプルと人工データだけを見る。本人の全記録を取り終えたことにはならない。
 
 ライセンスは AGPL-3.0-or-later。
+
+`assets/fonts/Splatoon2-Unified.otf` はNintendoの第三者資産であり、AGPLの対象外である。
+詳細は `THIRD_PARTY_NOTICES.md` を参照。

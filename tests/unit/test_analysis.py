@@ -223,5 +223,104 @@ class AnalysisTests(unittest.TestCase):
         self.assertIn(FIELD, text)
         self.assertIn('<table>', text)
 
+    def test_gui_font_embedding_and_fallback(self):
+        from ikarchive.gui import BUNDLED_FONT, write_gui
+        self.assertTrue(BUNDLED_FONT.is_file())
+
+        # 0. リポジトリ同梱フォントが既定で完全埋め込みされる。
+        page_default = Path(self.tmp.name) / 'default_font.html'
+        write_gui(self.store, page_default)
+        html_default = page_default.read_text(encoding='utf-8')
+        default_match = re.search(r"url\('data:font/otf;base64,([A-Za-z0-9+/=]+)'\)", html_default)
+        self.assertIsNotNone(default_match, 'bundled font data URL not found in HTML')
+        self.assertEqual(base64.b64decode(default_match.group(1)), BUNDLED_FONT.read_bytes())
+
+        # 1. フォント完全埋め込みの検査: 一時ファイルに任意のバイト列を書き、data URLデコード一致を検査
+        dummy_font_bytes = b'\x00\x01\x00\x00arbitrary-splatoon2-unified-otf-data\xfe\xff'
+        dummy_font_path = Path(self.tmp.name) / 'Splatoon2-Unified.otf'
+        dummy_font_path.write_bytes(dummy_font_bytes)
+
+        page_with_font = Path(self.tmp.name) / 'with_font.html'
+        write_gui(self.store, page_with_font, font_path=dummy_font_path)
+        html_with_font = page_with_font.read_text(encoding='utf-8')
+
+        match = re.search(r"url\('data:font/otf;base64,([A-Za-z0-9+/=]+)'\)", html_with_font)
+        self.assertIsNotNone(match, 'base64 data URL font-face not found in HTML')
+        decoded_bytes = base64.b64decode(match.group(1))
+        self.assertEqual(decoded_bytes, dummy_font_bytes)
+        self.assertIn('@font-face', html_with_font)
+        self.assertIn("'Splatoon2-Unified'", html_with_font)
+        self.assertFalse(re.search(r'(?<!sans-)serif\b', html_with_font), 'Standalone serif found in HTML')
+
+        # 2. フォント無し時の sans-serif フォールバック検査
+        page_no_font = Path(self.tmp.name) / 'no_font.html'
+        write_gui(self.store, page_no_font, font_path=Path(self.tmp.name) / 'nonexistent.otf')
+        html_no_font = page_no_font.read_text(encoding='utf-8')
+
+        self.assertNotIn('@font-face', html_no_font)
+        self.assertIn('system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', html_no_font)
+        self.assertFalse(re.search(r'(?<!sans-)serif\b', html_no_font), 'Standalone serif found in HTML')
+
+    def test_gui_graph_elements_and_series_summary(self):
+        from ikarchive.gui import write_gui
+        # 複数点系列 (チョーシ): -1, 1, 2
+        for suffix, when in (('a', '2026-09-22T03:00:00Z'), ('b', '2026-09-22T03:01:00Z'), ('c', '2026-09-22T03:02:00Z')):
+            detail = vs_detail('REGULAR', 'form_ui_' + suffix, (4, 4), rule='TURF_WAR')
+            detail['playedTime'] = when
+            detail['judgement'] = 'WIN' if suffix != 'c' else 'LOSE'
+            self.ingest('VsHistoryDetailQuery', {'data': {'vsHistoryDetail': detail}})
+
+        # 1点だけの系列 (surprisePower)
+        single = vs_detail('BANKARA', 'single_ui', (4, 4), bankara='CHALLENGE', rule='AREA')
+        single['surprisePower'] = 1500
+        single['playedTime'] = '2026-09-22T04:00:00Z'
+        self.ingest('VsHistoryDetailQuery', {'data': {'vsHistoryDetail': single}})
+
+        # 不正な日時の系列
+        bad_time = vs_detail('BANKARA', 'bad_time_ui', (4, 4), bankara='CHALLENGE', rule='AREA')
+        bad_time['bankaraMatch']['bankaraPower'] = {'power': 2000}
+        bad_time['playedTime'] = 'not-a-valid-iso-time'
+        self.ingest('VsHistoryDetailQuery', {'data': {'vsHistoryDetail': bad_time}})
+
+        page = Path(self.tmp.name) / 'graph_test.html'
+        write_gui(self.store, page)
+        html_text = page.read_text(encoding='utf-8')
+
+        # 最新値・直前からの増減・最小・最大・点数の表示検査
+        self.assertIn('最新値', html_text)
+        self.assertIn('直前からの増減', html_text)
+        self.assertIn('最小', html_text)
+        self.assertIn('最大', html_text)
+        self.assertIn('点数', html_text)
+        self.assertIn('ナワバリ / チョーシ', html_text)
+
+        # 1点だけの系列では増減が「—」であること
+        self.assertIn('—', html_text)
+
+        # 縦軸・横軸の明示
+        self.assertIn('class="axis y-axis"', html_text)
+        self.assertIn('class="axis x-axis"', html_text)
+
+        # 水平補助線と目盛りラベル
+        self.assertIn('class="grid-line"', html_text)
+        self.assertIn('class="tick-label y-tick-label"', html_text)
+
+        # 0が表示範囲内にある場合の明瞭なゼロ線
+        self.assertIn('class="grid-line zero-line"', html_text)
+
+        # X軸目盛り（日付目盛り・ヒゲ線）
+        self.assertIn('class="tick-label x-tick-label"', html_text)
+        self.assertIn('class="x-tick-mark"', html_text)
+        self.assertIn('09/22 03:00', html_text)
+
+        # 不正な日時の場合でも生成を失敗させず文字列が含まれていること
+        self.assertIn('not-a-valid-iso-', html_text)
+
+        # SVGアクセシビリティ（role="img", aria-labelledby, title, desc）
+        self.assertIn('role="img"', html_text)
+        self.assertIn('aria-labelledby="chart-title-', html_text)
+        self.assertIn('<title id="chart-title-', html_text)
+        self.assertIn('<desc id="chart-desc-', html_text)
+
 if __name__ == '__main__':
     unittest.main()

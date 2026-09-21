@@ -126,7 +126,8 @@ def main():
                 result={'backup':str(dest),'integrity':integrity}
             elif args.command=='export-xlsx':result=export_xlsx(store,args.destination)
             elif args.command=='gui':
-                result=write_gui(store,args.destination)
+                font_path=os.environ.get('IKARING_ARCHIVE_FONT')
+                result=write_gui(store,args.destination,font_path=font_path)
                 if sys.platform=='darwin':subprocess.run(['open',str(args.destination)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             elif args.command=='export':
                 out=args.directory.resolve();out.mkdir(parents=True,exist_ok=True,mode=0o700);count=0

@@ -5,6 +5,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'src/python'))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from ikarchive.store import Store, now, js
+from ikarchive.gui import contrast, ON_FIELD, FIELD, INK, PAPER, LINK
 from ikarchive.planner import Planner
 import archive
 
@@ -181,6 +182,46 @@ class AnalysisTests(unittest.TestCase):
         status = self.store.auth_status()
         self.assertFalse(status['reauth_required'])
         self.assertTrue(status['session_expires_soon'])
+
+    def test_every_rate_like_number_is_kept_and_combat_stats_are_not(self):
+        self.assertGreaterEqual(contrast(ON_FIELD, FIELD), 4.5)
+        self.assertGreaterEqual(contrast(INK, PAPER), 4.5)
+        self.assertGreaterEqual(contrast(LINK, PAPER), 4.5)
+        challenge = vs_detail('BANKARA', 'wp', (4, 4), bankara='CHALLENGE', rule='AREA')
+        challenge['bankaraMatch']['bankaraPower'] = {'power': 2100, 'weaponPower': 1980}
+        challenge['player'] = {'result': {'kill': 9}}
+        challenge['surprisePower'] = 1234
+        self.ingest('VsHistoryDetailQuery', {'data': {'vsHistoryDetail': challenge}})
+        xmatch = vs_detail('X_MATCH', 'xp', (4, 4), rule='GOAL')
+        xmatch['xMatch'] = {'lastXPower': 2400.5, 'entireXPower': 2300}
+        self.ingest('VsHistoryDetailQuery', {'data': {'vsHistoryDetail': xmatch}})
+        job = {'id': coop_id('eggs'), 'rule': 'BIG_RUN', 'playedTime': '2026-09-22T02:00:00Z', 'jobRate': 120, 'jobScore': 140,
+               'myResult': {'goldenDeliverCount': 40}, 'memberResults': [{'goldenDeliverCount': 99}],
+               'waveResults': [{'teamDeliverCount': 20}, {'teamDeliverCount': 22}]}
+        self.ingest('CoopHistoryDetailQuery', {'data': {'coopHistoryDetail': job}})
+        for suffix, when in (('a', '2026-09-22T03:00:00Z'), ('b', '2026-09-22T03:01:00Z'), ('c', '2026-09-22T03:02:00Z')):
+            detail = vs_detail('REGULAR', 'form'+suffix, (4, 4), rule='TURF_WAR')
+            detail['playedTime'] = when
+            detail['judgement'] = 'WIN' if suffix != 'c' else 'LOSE'
+            self.ingest('VsHistoryDetailQuery', {'data': {'vsHistoryDetail': detail}})
+        labels = {row[0] for row in self.store.db.execute('SELECT label FROM rate_points')}
+        self.assertIn('ブキチャレパワー', labels)
+        self.assertIn('バンカラパワー', labels)
+        self.assertIn('直前のXパワー', labels)
+        self.assertIn('surprisePower', labels)
+        self.assertNotIn('kill', {row[0] for row in self.store.db.execute("SELECT series_id FROM rate_points")})
+        self.assertEqual(self.store.db.execute("SELECT value FROM rate_points WHERE label='キンシャケ納品数'").fetchone()[0], 40)
+        self.assertEqual(self.store.db.execute("SELECT priority FROM rate_points WHERE label='バイトレート'").fetchone()[0], 'secondary')
+        self.assertEqual([row[0] for row in self.store.db.execute("SELECT value FROM rate_points WHERE label='チョーシ' ORDER BY played_time")], [1, 2, -1])
+        from ikarchive.gui import write_gui
+        page = Path(self.tmp.name) / 'index.html'
+        write_gui(self.store, page)
+        text = page.read_text(encoding='utf-8')
+        self.assertIn('ブキチャレパワー', text)
+        self.assertIn('チョーシ', text)
+        self.assertIn('surprisePower', text)
+        self.assertIn(FIELD, text)
+        self.assertIn('<table>', text)
 
 if __name__ == '__main__':
     unittest.main()

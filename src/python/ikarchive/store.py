@@ -4,6 +4,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 from .planner import walk, identity, decoded_id
 from .classify import classify_detail, classify_coop
+from .rates import observations, turf_form
 
 def now():return datetime.now(timezone.utc).isoformat()
 def js(value):return json.dumps(value,ensure_ascii=False,separators=(',',':'),sort_keys=True)
@@ -98,7 +99,9 @@ class Store:
             if full:
                 self.db.execute('INSERT OR IGNORE INTO documents VALUES(?,?,?,?,?)',(r['id'],a,kind,key,js(v)))
                 if okay:self.db.execute('UPDATE matches SET detail_response_id=? WHERE account=? AND kind=? AND match_key=? AND (detail_response_id IS NULL OR (SELECT fetched_at FROM responses WHERE id=detail_response_id)<=?)',(r['id'],a,kind,key,r['fetched_at']))
-                if kind in ('vs','coop'):self._write_classification(a,kind,key)
+                if kind in ('vs','coop'):
+                    self._write_classification(a,kind,key)
+                    self._write_rates(a,kind,key)
     def _assets(self,r,data):
         for path,v in walk(data):
             if not isinstance(v,str) or not v.startswith('https://'):continue
@@ -182,6 +185,7 @@ class Store:
     def _reclassify(self):
         for row in self.db.execute("SELECT account,kind,match_key FROM matches WHERE kind IN ('vs','coop') AND detail_response_id IS NOT NULL"):
             self._write_classification(row['account'],row['kind'],row['match_key'])
+            self._write_rates(row['account'],row['kind'],row['match_key'])
         self.db.commit()
     def _write_classification(self,account,kind,key):
         row=self.db.execute('''SELECT d.json_text,m.detail_response_id FROM matches m
@@ -195,6 +199,24 @@ class Store:
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(account,kind,match_key) DO UPDATE SET genre=excluded.genre,mode_raw=excluded.mode_raw,bankara_mode=excluded.bankara_mode,rule_raw=excluded.rule_raw,rule_name=excluded.rule_name,roster_class=excluded.roster_class,analysis_set=excluded.analysis_set,team_count=excluded.team_count,my_player_count=excluded.my_player_count,opponent_counts=excluded.opponent_counts,detail_response_id=excluded.detail_response_id,classified_at=excluded.classified_at''',
             (account,kind,key,info['genre'],info['mode_raw'],info['bankara_mode'],info['rule_raw'],info['rule_name'],info['roster_class'],info['analysis_set'],info['team_count'],info['my_player_count'],js(info['opponent_counts']),row['detail_response_id'],now()))
+    def _write_rates(self,account,kind,key):
+        row=self.db.execute('''SELECT d.json_text,c.genre,c.rule_raw,json_extract(d.json_text,'$.playedTime') played_time,json_extract(d.json_text,'$.judgement') judgement
+            FROM match_classification c JOIN documents d ON d.response_id=c.detail_response_id AND d.account=c.account AND d.kind=c.kind AND d.match_key=c.match_key
+            WHERE c.account=? AND c.kind=? AND c.match_key=?''',(account,kind,key)).fetchone()
+        self.db.execute('DELETE FROM rate_points WHERE account=? AND match_key=? AND source=?',(account,key,'api'))
+        if not row:return
+        detail=json.loads(row['json_text'])
+        for item in observations(detail,row['genre'],row['rule_raw']):
+            self.db.execute('''INSERT INTO rate_points(account,series_id,label,genre,rule_raw,match_key,played_time,value,source,priority)
+                VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account,series_id,match_key) DO UPDATE SET label=excluded.label,value=excluded.value,played_time=excluded.played_time,priority=excluded.priority,source=excluded.source''',
+                (account,item['series_id'],item['label'],item['genre'],item['rule_raw'],key,row['played_time'],item['value'],item['source'],item['priority']))
+        if row['genre']=='nawabari':self._rebuild_turf_form(account)
+    def _rebuild_turf_form(self,account):
+        rows=self.db.execute('''SELECT a.match_key,a.played_time,a.judgement FROM analysis_nawabari a WHERE a.account=? ORDER BY a.played_time,a.match_key''',(account,)).fetchall()
+        self.db.execute("DELETE FROM rate_points WHERE account=? AND series_id='nawabari||form'",(account,))
+        for row,streak in zip(rows,turf_form(row['judgement'] for row in rows)):
+            self.db.execute('''INSERT INTO rate_points(account,series_id,label,genre,rule_raw,match_key,played_time,value,source,priority)
+                VALUES(?,?,?,?,?,?,?,?,?,?)''',(account,'nawabari||form','チョーシ','nawabari','TURF_WAR',row['match_key'],row['played_time'],streak,'derived_judgement','primary'))
     def verify(self):
         errors=[]
         if self.db.execute('PRAGMA integrity_check').fetchone()[0]!='ok':errors.append('integrity_check')

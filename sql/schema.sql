@@ -24,6 +24,10 @@ CREATE TABLE IF NOT EXISTS match_classification(
  opponent_counts TEXT,detail_response_id INTEGER,classified_at TEXT NOT NULL,
  PRIMARY KEY(account,kind,match_key),
  FOREIGN KEY(account,kind,match_key) REFERENCES matches(account,kind,match_key));
+CREATE TABLE IF NOT EXISTS rate_points(
+ account TEXT NOT NULL,series_id TEXT NOT NULL,label TEXT NOT NULL,genre TEXT NOT NULL,rule_raw TEXT,
+ match_key TEXT NOT NULL,played_time TEXT,value REAL,source TEXT NOT NULL,priority TEXT NOT NULL,
+ PRIMARY KEY(account,series_id,match_key));
 CREATE TABLE IF NOT EXISTS match_tags(
  account TEXT NOT NULL,match_key TEXT NOT NULL,tag TEXT NOT NULL,note TEXT,
  created_at TEXT NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(account,match_key,tag));

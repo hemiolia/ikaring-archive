@@ -8,6 +8,7 @@ from ikarchive.locking import acquire
 from ikarchive.planner import Planner
 from ikarchive.collector import catalog, sync, ROOT
 from ikarchive.xlsx_export import export_xlsx
+from ikarchive.gui import write_gui
 
 OUTPUT=Path(os.environ.get('IKARING_ARCHIVE_DATA_DIR',str(Path.home()/'Documents/イカリング3アーカイブ')))
 DEFAULT=OUTPUT/'database/archive.sqlite3'
@@ -77,6 +78,7 @@ def main():
     p=sub.add_parser('backup');p.add_argument('destination',type=Path)
     p=sub.add_parser('export');p.add_argument('directory',type=Path)
     p=sub.add_parser('export-xlsx');p.add_argument('destination',nargs='?',type=Path,default=OUTPUT/'exports'/'分析.xlsx')
+    p=sub.add_parser('gui');p.add_argument('destination',nargs='?',type=Path,default=OUTPUT/'exports'/'gui'/'index.html')
     p=sub.add_parser('import');p.add_argument('directory',type=Path);p.add_argument('--account',required=True)
     p=sub.add_parser('sql');p.add_argument('query')
     p=sub.add_parser('install-service');p.add_argument('--interval',type=int,default=120);p.add_argument('--account');p.add_argument('--nxapi-data')
@@ -123,6 +125,9 @@ def main():
                 finally:check.close()
                 result={'backup':str(dest),'integrity':integrity}
             elif args.command=='export-xlsx':result=export_xlsx(store,args.destination)
+            elif args.command=='gui':
+                result=write_gui(store,args.destination)
+                if sys.platform=='darwin':subprocess.run(['open',str(args.destination)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             elif args.command=='export':
                 out=args.directory.resolve();out.mkdir(parents=True,exist_ok=True,mode=0o700);count=0
                 with (out/'manifest.jsonl').open('x') as index:

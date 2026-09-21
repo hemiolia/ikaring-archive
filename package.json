@@ -1,0 +1,25 @@
+{
+  "name": "ikaring-archive",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "python3 -m unittest discover -s tests/unit -v && node --test tests/integration/*.test.mjs",
+    "status": "python3 archive.py status",
+    "sync": "python3 archive.py sync"
+  },
+  "dependencies": {
+    "acorn": "8.15.0",
+    "nxapi": "1.6.1-next.257",
+    "read": "3.0.1"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "AGPL-3.0-or-later",
+  "description": "Lossless and audited SplatNet 3 archive with nxapi and SQLite",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hemiolia/ikaring-archive.git"
+  }
+}

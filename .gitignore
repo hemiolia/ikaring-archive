@@ -1,0 +1,13 @@
+node_modules/
+__pycache__/
+*.pyc
+.history/
+data/
+*.sqlite*
+*.db*
+*.log
+.env
+.env.*
+!config/*.example.json
+docs/research/downloads/
+.DS_Store

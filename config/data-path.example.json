@@ -1,0 +1,6 @@
+{
+  "note": "説明用。実行時設定は環境変数IKARING_ARCHIVE_DATA_DIRまたは--dbを使用します。",
+  "data_root": "~/Documents/イカリング3アーカイブ",
+  "database": "database/archive.sqlite3",
+  "credentials": "nxapiの標準保存先。リポジトリには保存しない。"
+}

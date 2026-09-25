@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """イカリング3の取得・保存・監査CLI（Python標準ライブラリのみ）。"""
-import argparse, base64, json, os, plistlib, shutil, sqlite3, subprocess, sys, uuid
+import argparse, base64, json, os, plistlib, re, shutil, sqlite3, subprocess, sys, uuid
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parent/'src/python'))
 from ikarchive.store import Store, now, js
@@ -13,6 +13,23 @@ from ikarchive.gui import write_gui
 OUTPUT=Path(os.environ.get('IKARING_ARCHIVE_DATA_DIR',str(Path.home()/'Documents/イカリング3アーカイブ')))
 DEFAULT=OUTPUT/'database/archive.sqlite3'
 AUTH_INCIDENTS={'AUTH_REQUIRED','AUTH_EXPIRED','SESSION_EXPIRED'}
+
+def nas_storage_marker():
+    marker=OUTPUT/'config'/'storage-location.json'
+    if not marker.exists() and not marker.is_symlink():return None
+    try:
+        if marker.is_symlink():raise ValueError('symlink')
+        data=json.loads(marker.read_text(encoding='utf-8'))
+        if not isinstance(data,dict) or type(data.get('schema_version')) is not int or data['schema_version']!=1 or data.get('backend')!='nas':
+            raise ValueError('schema or backend')
+        if not isinstance(data.get('ssh_host'),str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,252}',data['ssh_host']):
+            raise ValueError('ssh host')
+        if not isinstance(data.get('container'),str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}',data['container']):
+            raise ValueError('container')
+        if data.get('database')!='/data/database/archive.sqlite3':raise ValueError('database')
+    except (OSError,UnicodeError,json.JSONDecodeError,ValueError,TypeError,KeyError) as exc:
+        raise ValueError('NAS_STORAGE_MARKER_INVALID: '+str(marker)) from exc
+    return data
 
 def notify_auth_incident(code):
     stamp=OUTPUT/'logs'/'auth-notice-stamp'
@@ -65,8 +82,118 @@ def audit(store):
         states=[dict(r) for r in store.db.execute('SELECT state,count(*) count FROM jobs WHERE operation=? GROUP BY state',(name,))]
         responses=store.db.execute('SELECT count(*) FROM responses WHERE operation=?',(name,)).fetchone()[0]
         entities=p.routes.get(name,{}).get('bindings',{})
-        ops.append({'operation':name,'classification':'excluded_action' if name in p.excluded else 'unsupported' if name in p.unsupported else 'related' if entities else 'root','reason':p.excluded.get(name) or p.unsupported.get(name),'states':states,'responses':responses,'needs_entities':entities})
+        ops.append({'operation':name,'classification':'excluded' if name in p.excluded else 'unsupported' if name in p.unsupported else 'related' if entities else 'root','reason':p.excluded.get(name) or p.unsupported.get(name),'states':states,'responses':responses,'needs_entities':entities})
     return {'catalog_at':m.get('fetched_at'),'version':m.get('version'),'extracted':len(p.queries),'read_routes':len(p.routes),'unsupported':p.unsupported,'operations':ops,'storage':store.status(),'all_server_records_verified':False,'limit':'Server-internal records and records no longer exposed by SplatNet cannot be proven complete from the client API.'}
+
+def dispatch(store,args):
+    if args.command=='init':result=store.status()
+    elif args.command=='refresh-catalog':
+        m=catalog(store,True);p=Planner(m);result={'version':m.get('version'),'extracted':len(p.queries),'read_routes':len(p.routes),'unsupported':p.unsupported}
+    elif args.command=='sync':
+        if args.budget<1 or args.delay<0:raise ValueError('budget>=1, delay>=0')
+        from ikarchive.publish import publish_outputs
+        try:result=sync(store,args.account,args.nxapi_data,args.budget,args.delay)
+        finally:published=publish_outputs(store)
+        result['exports']=published
+    elif args.command=='status':result=store.status()
+    elif args.command=='audit':result=audit(store)
+    elif args.command=='verify':
+        failures=store.verify();result={'ok':not failures,'failures':failures,'bodies_checked':store.db.execute('SELECT count(*) FROM bodies').fetchone()[0]}
+        print(json.dumps(result,ensure_ascii=False,indent=2));return 1 if failures else 0
+    elif args.command=='backup':
+        from ikarchive.storage import ensure_backup_space
+        dest=args.destination.resolve()
+        if dest.exists():raise ValueError('Destination already exists; refusing overwrite')
+        ensure_backup_space(store.db,dest)
+        dest.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+        import tempfile
+        fd,tmpname=tempfile.mkstemp(prefix=dest.name+'.',suffix='.tmp',dir=dest.parent)
+        os.close(fd);tmp=Path(tmpname)
+        try:
+            target=sqlite3.connect(tmp)
+            try:store.db.backup(target)
+            finally:target.close()
+            check=sqlite3.connect(tmp)
+            try:integrity=check.execute('PRAGMA integrity_check').fetchone()[0]
+            finally:check.close()
+            if integrity!='ok':raise RuntimeError('BACKUP_INTEGRITY_FAILED')
+            # Atomic creation without overwriting an existing backup.
+            os.link(tmp,dest)
+        finally:
+            tmp.unlink(missing_ok=True)
+            Path(str(tmp)+'-journal').unlink(missing_ok=True)
+            Path(str(tmp)+'-wal').unlink(missing_ok=True)
+            Path(str(tmp)+'-shm').unlink(missing_ok=True)
+        result={'backup':str(dest),'integrity':integrity}
+    elif args.command=='export-xlsx':result=export_xlsx(store,args.destination)
+    elif args.command=='gui':
+        font_path=os.environ.get('IKARING_ARCHIVE_FONT')
+        result=write_gui(store,args.destination,font_path=font_path)
+        if sys.platform=='darwin':subprocess.run(['open',str(args.destination)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    elif args.command=='export':
+        out=args.directory.resolve();out.mkdir(parents=True,exist_ok=True,mode=0o700);count=0
+        with (out/'manifest.jsonl').open('x') as index:
+            for r in store.db.execute('SELECT r.*,b.body FROM responses r JOIN bodies b ON b.sha256=r.body_sha256 ORDER BY r.id'):
+                filename=f'{r["id"]}-{r["body_sha256"]}.json';(out/filename).write_bytes(r['body']);meta=dict(r);meta.pop('body');meta.pop('json_text');meta['file']=filename;index.write(js(meta)+'\n');count+=1
+        assets=0
+        with (out/'assets.jsonl').open('x') as index:
+            for r in store.db.execute("SELECT a.*,b.body FROM assets a JOIN bodies b ON b.sha256=a.body_sha256 WHERE a.state='done'"):
+                filename=r['body_sha256']+'.bin';(out/filename).write_bytes(r['body']);meta=dict(r);meta.pop('body');meta['file']=filename;index.write(js(meta)+'\n');assets+=1
+        if store.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='response_fetches'").fetchone():
+            with (out/'fetches.jsonl').open('x') as index:
+                for r in store.db.execute('SELECT * FROM response_fetches ORDER BY fetched_at,event_id'):
+                    index.write(js(dict(r))+'\n')
+        result={'export':str(out),'responses':count,'assets':assets}
+    elif args.command=='import':
+        p=Planner(catalog(store));count=0;rejected=[]
+        for file in sorted(args.directory.rglob('*.json')):
+            try:
+                raw=file.read_bytes();data=json.loads(raw);op=None
+                if isinstance(data,dict) and 'body_base64' in data and 'event_id' in data:
+                    if data['account']!=args.account:raise ValueError('account mismatch')
+                    e=data
+                else:
+                    # Explicit nxapi dump wrappers. The source bytes are kept verbatim.
+                    result=data.get('result') if isinstance(data,dict) else None
+                    if isinstance(result,dict):
+                        from ikarchive.planner import identity
+                        ident=identity(result.get('id'))
+                        if ident:op='VsHistoryDetailQuery' if ident[0]=='vs' else 'CoopHistoryDetailQuery'
+                    e={'event_id':'import-'+args.account+'-'+__import__('hashlib').sha256(raw).hexdigest(),'account':args.account,'fetched_at':now(),'operation':'nxapi-import','variables':{'filename':str(file)},'status':200,'body_base64':base64.b64encode(raw).decode()}
+                rid=store.record(e)
+                if op:
+                    # An additional derived envelope is explicitly labeled, original is retained.
+                    body={'data':{'vsHistoryDetail' if op=='VsHistoryDetailQuery' else 'coopHistoryDetail':result}}
+                    derived={**e,'event_id':e['event_id']+'-projection','operation':op,'body_base64':base64.b64encode(js(body).encode()).decode()}
+                    drid=store.record(derived);store.project(drid,p)
+                store.project(rid,p);count+=1
+            except (ValueError,OSError,TypeError) as exc:rejected.append({'file':str(file),'error':type(exc).__name__})
+        result={'imported':count,'rejected':rejected}
+    elif args.command=='tag':result=apply_tag(store,args)
+    elif args.command=='sql':
+        store.db.execute('PRAGMA query_only=ON');result=[dict(r) for r in store.db.execute(args.query)]
+    elif args.command=='install-service':
+        if sys.platform!='darwin':raise ValueError('LaunchAgent is macOS-only; use cron on other systems')
+        if args.interval<60:raise ValueError('interval must be >=60 seconds')
+        (OUTPUT/'logs').mkdir(parents=True,exist_ok=True,mode=0o700)
+        label='local.ikaring3.archive';dest=Path.home()/'Library/LaunchAgents'/f'{label}.plist'
+        if dest.exists():
+            backup=dest.with_suffix('.plist.backup-'+uuid.uuid4().hex[:8]);shutil.copy2(dest,backup)
+        command=[sys.executable,str(ROOT/'archive.py'),'--db',str(args.db),'sync']
+        if args.account:command+=['--account',args.account]
+        if args.nxapi_data:command+=['--nxapi-data',args.nxapi_data]
+        node=shutil.which('node')
+        env={'PATH':str(Path(node).parent)+':/usr/bin:/bin' if node else '/usr/bin:/bin','NODE':node,'IKARING_ARCHIVE_DATA_DIR':str(OUTPUT.resolve())}
+        if 'NXAPI_DATA_PATH' in os.environ:env['NXAPI_DATA_PATH']=os.environ['NXAPI_DATA_PATH']
+        payload={'Label':label,'ProgramArguments':command,'WorkingDirectory':str(ROOT),'StartInterval':args.interval,'RunAtLoad':True,'ProcessType':'Background','EnvironmentVariables':env,'StandardOutPath':str(OUTPUT/'logs/service.log'),'StandardErrorPath':str(OUTPUT/'logs/service-errors.log')}
+        dest.parent.mkdir(parents=True,exist_ok=True);dest.write_bytes(plistlib.dumps(payload))
+        subprocess.run(['launchctl','bootout',f'gui/{os.getuid()}/{label}'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        subprocess.run(['launchctl','bootstrap',f'gui/{os.getuid()}',str(dest)],check=True)
+        result={'service':str(dest),'interval_seconds':args.interval,'login_required':True}
+    if args.command=='sync':
+        incident=OUTPUT/'logs'/'auth-incident.json'
+        if incident.exists():incident.unlink()
+    print(json.dumps(result,ensure_ascii=False,indent=2));return 0
 
 def main():
     os.umask(0o077)
@@ -86,109 +213,39 @@ def main():
     sub.add_parser('login')
     p=sub.add_parser('watch');p.add_argument('--interval',type=int,default=120)
     args=parser.parse_args();args.db=args.db.resolve()
+    if args.command=='login':
+        # Interactive nxapi login runs in the user's terminal, never passes tokens as argv.
+        binary=ROOT/'src/node/login.mjs'
+        return subprocess.call([os.environ.get('NODE','node'),str(binary)])
+    if args.db==DEFAULT.resolve() and nas_storage_marker() is not None:
+        raise ValueError('NAS_STORAGE_ACTIVE: use scripts/nas_archive.py; local default database access is disabled')
     if args.command=='watch':
         import time
         if args.interval<60:raise ValueError('interval must be >=60')
         while True:
             subprocess.run([sys.executable,str(ROOT/'archive.py'),'--db',str(args.db),'sync'])
             time.sleep(args.interval)
-    if args.command=='login':
-        # Interactive nxapi login runs in the user's terminal, never passes tokens as argv.
-        binary=ROOT/'src/node/login.mjs'
-        return subprocess.call([os.environ.get('NODE','node'),str(binary)])
+    readonly_commands={'status','audit','verify','sql','backup','export','export-xlsx','gui'}
+    is_readonly=(args.command in readonly_commands) or (args.command=='tag' and getattr(args,'tag_action',None)=='list')
+    if is_readonly:
+        if not args.db.is_file():
+            raise FileNotFoundError(f'Database not found: {args.db}')
+        store=Store(args.db,readonly=True)
+        store.db.execute('BEGIN')
+        try:
+            return dispatch(store,args)
+        finally:
+            try:store.db.rollback()
+            except sqlite3.Error:pass
+            store.close()
+
     args.db.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
     with open(str(args.db)+'.lock','a') as lock:
         try:acquire(lock)
         except BlockingIOError:print(js({'state':'another_sync_running'}));return 0
         store=Store(args.db)
         try:
-            if args.command=='init':result=store.status()
-            elif args.command=='refresh-catalog':
-                m=catalog(store,True);p=Planner(m);result={'version':m.get('version'),'extracted':len(p.queries),'read_routes':len(p.routes),'unsupported':p.unsupported}
-            elif args.command=='sync':
-                if args.budget<1 or args.delay<0:raise ValueError('budget>=1, delay>=0')
-                result=sync(store,args.account,args.nxapi_data,args.budget,args.delay)
-            elif args.command=='status':result=store.status()
-            elif args.command=='audit':result=audit(store)
-            elif args.command=='verify':
-                failures=store.verify();result={'ok':not failures,'failures':failures,'bodies_checked':store.db.execute('SELECT count(*) FROM bodies').fetchone()[0]}
-                print(json.dumps(result,ensure_ascii=False,indent=2));return 1 if failures else 0
-            elif args.command=='backup':
-                dest=args.destination.resolve()
-                if dest.exists():raise ValueError('Destination already exists; refusing overwrite')
-                dest.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
-                target=sqlite3.connect(dest)
-                try:store.db.backup(target)
-                finally:target.close()
-                check=sqlite3.connect(dest)
-                try:integrity=check.execute('PRAGMA integrity_check').fetchone()[0]
-                finally:check.close()
-                result={'backup':str(dest),'integrity':integrity}
-            elif args.command=='export-xlsx':result=export_xlsx(store,args.destination)
-            elif args.command=='gui':
-                font_path=os.environ.get('IKARING_ARCHIVE_FONT')
-                result=write_gui(store,args.destination,font_path=font_path)
-                if sys.platform=='darwin':subprocess.run(['open',str(args.destination)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-            elif args.command=='export':
-                out=args.directory.resolve();out.mkdir(parents=True,exist_ok=True,mode=0o700);count=0
-                with (out/'manifest.jsonl').open('x') as index:
-                    for r in store.db.execute('SELECT r.*,b.body FROM responses r JOIN bodies b ON b.sha256=r.body_sha256 ORDER BY r.id'):
-                        filename=f'{r["id"]}-{r["body_sha256"]}.json';(out/filename).write_bytes(r['body']);meta=dict(r);meta.pop('body');meta.pop('json_text');meta['file']=filename;index.write(js(meta)+'\n');count+=1
-                assets=0
-                with (out/'assets.jsonl').open('x') as index:
-                    for r in store.db.execute("SELECT a.*,b.body FROM assets a JOIN bodies b ON b.sha256=a.body_sha256 WHERE a.state='done'"):
-                        filename=r['body_sha256']+'.bin';(out/filename).write_bytes(r['body']);meta=dict(r);meta.pop('body');meta['file']=filename;index.write(js(meta)+'\n');assets+=1
-                result={'export':str(out),'responses':count,'assets':assets}
-            elif args.command=='import':
-                p=Planner(catalog(store));count=0;rejected=[]
-                for file in sorted(args.directory.rglob('*.json')):
-                    try:
-                        raw=file.read_bytes();data=json.loads(raw);op=None
-                        if isinstance(data,dict) and 'body_base64' in data and 'event_id' in data:
-                            if data['account']!=args.account:raise ValueError('account mismatch')
-                            e=data
-                        else:
-                            # Explicit nxapi dump wrappers. The source bytes are kept verbatim.
-                            result=data.get('result') if isinstance(data,dict) else None
-                            if isinstance(result,dict):
-                                from ikarchive.planner import identity
-                                ident=identity(result.get('id'))
-                                if ident:op='VsHistoryDetailQuery' if ident[0]=='vs' else 'CoopHistoryDetailQuery'
-                            e={'event_id':'import-'+args.account+'-'+__import__('hashlib').sha256(raw).hexdigest(),'account':args.account,'fetched_at':now(),'operation':'nxapi-import','variables':{'filename':str(file)},'status':200,'body_base64':base64.b64encode(raw).decode()}
-                        rid=store.record(e)
-                        if op:
-                            # An additional derived envelope is explicitly labeled, original is retained.
-                            body={'data':{'vsHistoryDetail' if op=='VsHistoryDetailQuery' else 'coopHistoryDetail':result}}
-                            derived={**e,'event_id':e['event_id']+'-projection','operation':op,'body_base64':base64.b64encode(js(body).encode()).decode()}
-                            drid=store.record(derived);store.project(drid,p)
-                        store.project(rid,p);count+=1
-                    except (ValueError,OSError,TypeError) as exc:rejected.append({'file':str(file),'error':type(exc).__name__})
-                result={'imported':count,'rejected':rejected}
-            elif args.command=='tag':result=apply_tag(store,args)
-            elif args.command=='sql':
-                store.db.execute('PRAGMA query_only=ON');result=[dict(r) for r in store.db.execute(args.query)]
-            elif args.command=='install-service':
-                if sys.platform!='darwin':raise ValueError('LaunchAgent is macOS-only; use cron on other systems')
-                if args.interval<60:raise ValueError('interval must be >=60 seconds')
-                (OUTPUT/'logs').mkdir(parents=True,exist_ok=True,mode=0o700)
-                label='local.ikaring3.archive';dest=Path.home()/'Library/LaunchAgents'/f'{label}.plist'
-                if dest.exists():
-                    backup=dest.with_suffix('.plist.backup-'+uuid.uuid4().hex[:8]);shutil.copy2(dest,backup)
-                command=[sys.executable,str(ROOT/'archive.py'),'--db',str(args.db),'sync']
-                if args.account:command+=['--account',args.account]
-                if args.nxapi_data:command+=['--nxapi-data',args.nxapi_data]
-                node=shutil.which('node')
-                env={'PATH':str(Path(node).parent)+':/usr/bin:/bin' if node else '/usr/bin:/bin','NODE':node,'IKARING_ARCHIVE_DATA_DIR':str(OUTPUT.resolve())}
-                if 'NXAPI_DATA_PATH' in os.environ:env['NXAPI_DATA_PATH']=os.environ['NXAPI_DATA_PATH']
-                payload={'Label':label,'ProgramArguments':command,'WorkingDirectory':str(ROOT),'StartInterval':args.interval,'RunAtLoad':True,'ProcessType':'Background','EnvironmentVariables':env,'StandardOutPath':str(OUTPUT/'logs/service.log'),'StandardErrorPath':str(OUTPUT/'logs/service-errors.log')}
-                dest.parent.mkdir(parents=True,exist_ok=True);dest.write_bytes(plistlib.dumps(payload))
-                subprocess.run(['launchctl','bootout',f'gui/{os.getuid()}/{label}'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-                subprocess.run(['launchctl','bootstrap',f'gui/{os.getuid()}',str(dest)],check=True)
-                result={'service':str(dest),'interval_seconds':args.interval,'login_required':True}
-            if args.command=='sync':
-                incident=OUTPUT/'logs'/'auth-incident.json'
-                if incident.exists():incident.unlink()
-            print(json.dumps(result,ensure_ascii=False,indent=2));return 0
+            return dispatch(store,args)
         finally:store.close()
 
 if __name__=='__main__':

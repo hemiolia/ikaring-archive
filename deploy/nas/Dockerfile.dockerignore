@@ -1,0 +1,24 @@
+# Docker resolves this file for deploy/nas/Dockerfile when the repository root
+# is the build context. Keep every path excluded until explicitly allowed.
+*
+!archive.py
+!package.json
+!package-lock.json
+!.npmrc
+!src/
+!src/python/
+!src/python/ikarchive/
+!src/python/ikarchive/*.py
+!src/node/
+!src/node/*.mjs
+!sql/
+!sql/schema.sql
+!config/
+!config/font-unicode-ranges.json
+!assets/
+!assets/fonts/
+!assets/fonts/Splatoon2-Unified.otf
+!deploy/
+!deploy/nas/
+!deploy/nas/Dockerfile
+!deploy/nas/Dockerfile.dockerignore

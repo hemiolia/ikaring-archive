@@ -1,0 +1,11 @@
+# Docker resolves this file for deploy/nas/Backup.Dockerfile when the repository root
+# is the build context. Keep every path excluded until explicitly allowed.
+*
+!scripts/
+!scripts/nas_create_verified_backup.sh
+!scripts/verified_backup_support.py
+!scripts/nas_backup_cycle.py
+!deploy/
+!deploy/nas/
+!deploy/nas/Backup.Dockerfile
+!deploy/nas/Backup.Dockerfile.dockerignore

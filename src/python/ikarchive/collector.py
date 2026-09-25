@@ -3,9 +3,12 @@ from pathlib import Path
 from urllib.parse import urlparse
 from .store import now, js, digest
 from .planner import Planner
+from .storage import storage_health
+from .ranking_policy import apply_scope, SCOPED_OPS
 
 ROOT=Path(__file__).resolve().parents[3]
 HISTORIES={'LatestBattleHistoriesQuery','RegularBattleHistoriesQuery','BankaraBattleHistoriesQuery','XBattleHistoriesQuery','EventBattleHistoriesQuery','PrivateBattleHistoriesQuery','CoopHistoryQuery'}
+HISTORY_REFRESH_SECONDS=120
 
 class Bridge:
     def __init__(self):
@@ -47,16 +50,21 @@ def catalog(store,force=False):
     return manifest
 
 def priority(job):
-    if job['operation'] in ('VsHistoryDetailQuery','CoopHistoryDetailQuery'):return 0
-    if job['operation'] in HISTORIES:return 1
-    if job['kind']:return 2
+    if job['operation'] in HISTORIES:return 0
+    if job['operation'] in ('VsHistoryDetailQuery','CoopHistoryDetailQuery'):return 1
+    if job['kind']:return 3
     if 'Ranking' in job['operation']:return 5
-    return 3
+    return 2
 
 def sync(store,account=None,data_path=None,budget=250,delay=1.5):
+    # The caller owns the archive writer lock. A previous running row therefore
+    # describes an interrupted process, not a second live collector.
+    with store.db:
+        store.db.execute("UPDATE runs SET status='interrupted',finished_at=?,error='PROCESS_INTERRUPTED' WHERE status='running'",(now(),))
     run=store.db.execute("INSERT INTO runs(started_at,status,account) VALUES(?,'running',?)",(now(),account)).lastrowid;store.db.commit()
     bridge=None
     try:
+        if storage_health(store.path)['state']=='critical':raise RuntimeError('STORAGE_CRITICAL')
         row=store.db.execute('SELECT fetched_at FROM manifests ORDER BY fetched_at DESC LIMIT 1').fetchone()
         from datetime import datetime,timezone
         stale=not row or (datetime.now(timezone.utc)-datetime.fromisoformat(row[0].replace('Z','+00:00'))).total_seconds()>86400
@@ -80,16 +88,38 @@ def sync(store,account=None,data_path=None,budget=250,delay=1.5):
             store.db.execute("UPDATE jobs SET state='pending' WHERE account=? AND state='done' AND next_attempt<=?",(account,time.time()))
             # A repeated-page guard applies to a crawl epoch, not to last day's identical content.
             store.db.execute('DELETE FROM page_fingerprints WHERE account=?',(account,))
+        apply_scope(store,account)
+        scope_dirty=False
         count=0
+        next_history_refresh=time.monotonic()+HISTORY_REFRESH_SECONDS
         while count<budget:
+            space=storage_health(store.path)
+            if space['state']=='critical':raise RuntimeError('STORAGE_CRITICAL')
+            if time.monotonic()>=next_history_refresh:
+                from .publish import publish_outputs
+                publish_outputs(store)
+                # Long initial crawls must keep observing the short live history window.
+                # Only successful jobs are refreshed; retry deadlines remain intact.
+                with store.db:
+                    for op in HISTORIES:
+                        store.db.execute("UPDATE jobs SET state='pending',next_attempt=0 WHERE account=? AND operation=? AND state='done'",(account,op))
+                next_history_refresh=time.monotonic()+HISTORY_REFRESH_SECONDS
             jobs=store.db.execute("SELECT * FROM jobs WHERE account=? AND state IN ('pending','retry') AND next_attempt<=?",(account,time.time())).fetchall()
             jobs=[j for j in jobs if j['operation'] in planner.routes]
+            # Keep the finite live history window first. Deferred records remain
+            # queued and resume automatically when disk space is available.
+            if space['state']=='low':jobs=[j for j in jobs if priority(j)<=1]
             if not jobs:break
             job=min(jobs,key=lambda j:(priority(j),j['attempts'],j['operation'],j['variables_json']))
+            if scope_dirty and priority(job)>1:
+                apply_scope(store,account)
+                scope_dirty=False
+                continue
             op=job['operation'];variables=json.loads(job['variables_json']);q=planner.queries[op]
             try:
                 result=bridge.call('query',operation=op,variables=variables,query_id=q['params']['id'],version=manifest.get('version'))
                 f=Path(result['spool_file']);e=json.loads(f.read_text());rid=store.record(e,run);store.project(rid,planner,country);f.unlink()
+                if op in SCOPED_OPS or op=='VsHistoryDetailQuery' or 'Ranking' in op:scope_dirty=True
                 status=e['status']
                 if status in (401,403,429) or status>=500:
                     retry=e.get('headers',{}).get('retry-after','300')
@@ -107,8 +137,9 @@ def sync(store,account=None,data_path=None,budget=250,delay=1.5):
                     store.db.execute("UPDATE jobs SET state='retry',attempts=attempts+1,next_attempt=? WHERE account=? AND operation=? AND variables_json=?",(time.time()+min(3600,30*2**min(job['attempts'],7)),account,op,job['variables_json']))
             count+=1
             if delay:time.sleep(delay)
+        if scope_dirty:apply_scope(store,account)
         asset_count=fetch_assets(store,min(50,budget),delay)
-        pending=store.db.execute("SELECT count(*) FROM jobs WHERE account=? AND state!='done'",(account,)).fetchone()[0]
+        pending=store.db.execute("SELECT count(*) FROM jobs WHERE account=? AND state IN ('pending','retry','awaiting_scope')",(account,)).fetchone()[0]
         missing_assets=store.db.execute("SELECT count(*) FROM assets WHERE state!='done'").fetchone()[0]
         state='partial' if pending or missing_assets or planner.unsupported else 'available_routes_collected'
         with store.db:store.db.execute('UPDATE runs SET finished_at=?,status=? WHERE id=?',(now(),state,run))
@@ -119,7 +150,7 @@ def sync(store,account=None,data_path=None,budget=250,delay=1.5):
         code=str(exc) if isinstance(exc,RuntimeError) and str(exc).isupper() else type(exc).__name__
         with store.db:store.db.execute("UPDATE runs SET finished_at=?,status='blocked',error=? WHERE id=?",(now(),code,run))
         if code in ('AUTH_REQUIRED','AUTH_EXPIRED','SESSION_EXPIRED'):store.remember_auth_failure(code)
-        elif code=='NETWORK':store.remember_sync_error(code)
+        else:store.remember_sync_error(code)
         raise RuntimeError(code) from None
     finally:
         if bridge:bridge.close()
@@ -136,7 +167,10 @@ class SafeRedirect(urllib.request.HTTPRedirectHandler):
 def fetch_assets(store,budget,delay):
     rows=store.db.execute("SELECT * FROM assets WHERE state!='done' AND next_attempt<=? ORDER BY attempts LIMIT ?",(time.time(),budget)).fetchall()
     opener=urllib.request.build_opener(SafeRedirect())
+    started=time.monotonic();attempted=0
     for r in rows:
+        if time.monotonic()-started>=HISTORY_REFRESH_SECONDS or storage_health(store.path)['state']!='normal':break
+        attempted+=1
         url=r['url']
         try:
             if not allowed_asset(url):raise ValueError('ASSET_HOST_UNREVIEWED')
@@ -149,4 +183,4 @@ def fetch_assets(store,budget,delay):
         except Exception as exc:
             with store.db:store.db.execute("UPDATE assets SET state='retry',attempts=attempts+1,next_attempt=?,last_error=? WHERE url=?",(time.time()+3600,type(exc).__name__,url))
         if delay:time.sleep(delay)
-    return len(rows)
+    return attempted

@@ -1,7 +1,8 @@
 """分析ビューを人が開く xlsx にする。正本ではない。編集はデータベースへ戻らない。"""
-import zipfile
+import json, os, tempfile, zipfile
 from pathlib import Path
 from xml.sax.saxutils import escape
+from .display import GENRE_LABELS, format_rule
 
 CELL_LIMIT = 32767
 NS_MAIN = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
@@ -10,26 +11,15 @@ NS_PKG = 'http://schemas.openxmlformats.org/package/2006/relationships'
 NS_CT = 'http://schemas.openxmlformats.org/package/2006/content-types'
 
 VS_HEADERS = ('対戦日時','ルール','ルールコード','ステージ','勝敗','ノックアウト','試合秒','自分側人数','相手人数','ブキ','キル','アシスト','デス','スペシャル','塗り','タグ','試合ID')
-SALMON_HEADERS = ('プレイ日時','ルールコード','ステージ','危険度','WAVE','試合ID')
+SALMON_HEADERS = ('プレイ日時','ルール','ステージ','キケン度（%）','WAVE','試合ID')
 HOLD_HEADERS = ('種別','区分','APIモード','ルール','人数区分','試合ID')
 
-SHEETS = (
-    ('ナワバリ','analysis_nawabari','vs'),
-    ('オープン','analysis_bankara_open','vs'),
-    ('チャレンジ','analysis_bankara_challenge','vs'),
-    ('イベマ','analysis_event','vs'),
-    ('Xマッチ','analysis_xmatch','vs'),
-    ('フェス','analysis_fest','vs'),
-    ('プラベ4対4','analysis_private_four_vs_four','vs'),
-    ('プラベ3対3','analysis_private_three_vs_three','vs'),
-    ('プラベ2対2','analysis_private_two_vs_two','vs'),
-    ('プラベ1対1','analysis_private_one_vs_one','vs'),
-    ('プラベその他','analysis_private_other','vs'),
-    ('バイト','analysis_salmon_regular','salmon'),
-    ('ビッグラン','analysis_big_run','salmon'),
-    ('バイトチームコンテスト','analysis_team_contest','salmon'),
-    ('保留','analysis_hold','hold'),
-)
+SHEETS = tuple((GENRE_LABELS.get(genre,'区分保留'), 'analysis_'+genre,kind) for genre,kind in (
+    ('fest','vs'),('nawabari','vs'),('bankara_challenge','vs'),('bankara_open','vs'),
+    ('xmatch','vs'),('event','vs'),('private_four_vs_four','vs'),('private_three_vs_three','vs'),
+    ('private_two_vs_two','vs'),('private_one_vs_one','vs'),('private_other','vs'),
+    ('salmon_regular','salmon'),('big_run','salmon'),('team_contest','salmon'),('hold','hold'),
+))
 
 def _col(n):
     s=''
@@ -55,21 +45,81 @@ def _sheet(rows):
     return ''.join(body)
 
 def _vs_rows(db,view):
-    sql=f'''SELECT a.played_time,a.rule_name,a.rule_raw,a.stage,a.judgement,a.knockout,a.duration,a.my_player_count,a.opponent_counts,
-        (SELECT p.weapon FROM battle_players p WHERE p.account=a.account AND p.match_key=a.match_key AND p.is_myself=1 LIMIT 1),
-        (SELECT p.kills FROM battle_players p WHERE p.account=a.account AND p.match_key=a.match_key AND p.is_myself=1 LIMIT 1),
-        (SELECT p.assists FROM battle_players p WHERE p.account=a.account AND p.match_key=a.match_key AND p.is_myself=1 LIMIT 1),
-        (SELECT p.deaths FROM battle_players p WHERE p.account=a.account AND p.match_key=a.match_key AND p.is_myself=1 LIMIT 1),
-        (SELECT p.specials FROM battle_players p WHERE p.account=a.account AND p.match_key=a.match_key AND p.is_myself=1 LIMIT 1),
-        (SELECT p.paint FROM battle_players p WHERE p.account=a.account AND p.match_key=a.match_key AND p.is_myself=1 LIMIT 1),
-        (SELECT group_concat(t.tag,'、') FROM match_tags t WHERE t.account=a.account AND t.match_key=a.match_key),
-        a.match_key
-        FROM {view} a ORDER BY a.played_time,a.match_key'''
-    return [VS_HEADERS]+[tuple(row) for row in db.execute(sql)]
+    tags_map = {
+        (r[0], r[1]): r[2]
+        for r in db.execute("SELECT account,match_key,group_concat(tag,'、') FROM match_tags GROUP BY account,match_key")
+    }
+    sql = f'''SELECT a.played_time,a.rule_name,a.rule_raw,a.stage,a.judgement,a.knockout,a.duration,a.my_player_count,a.opponent_counts,a.account,a.match_key,d.json_text
+        FROM {view} a
+        JOIN documents d ON d.response_id=a.detail_response_id AND d.account=a.account AND d.kind='vs' AND d.match_key=a.match_key
+        ORDER BY a.played_time,a.match_key'''
+    rows = [VS_HEADERS]
+    for r in db.execute(sql):
+        played_time, rule_name, rule_raw, stage, judgement, knockout, duration, my_player_count, opponent_counts, account, match_key, json_text = r
+        weapon = kills = assists = deaths = specials = paint = None
+        if json_text:
+            try:
+                data = json.loads(json_text)
+            except Exception:
+                data = None
+            if isinstance(data, dict):
+                teams = []
+                my_team = data.get('myTeam')
+                if isinstance(my_team, dict):
+                    teams.append(my_team)
+                other_teams = data.get('otherTeams')
+                if isinstance(other_teams, list):
+                    for ot in other_teams:
+                        if isinstance(ot, dict):
+                            teams.append(ot)
+                target_player = None
+                for team in teams:
+                    players = team.get('players')
+                    if isinstance(players, list):
+                        for p in players:
+                            if isinstance(p, dict):
+                                is_myself = p.get('isMyself')
+                                if is_myself is True or is_myself == 1:
+                                    target_player = p
+                                    break
+                    if target_player is not None:
+                        break
+                if target_player is not None:
+                    w = target_player.get('weapon')
+                    if isinstance(w, dict):
+                        weapon = w.get('name')
+                    res = target_player.get('result')
+                    if isinstance(res, dict):
+                        kills = res.get('kill')
+                        assists = res.get('assist')
+                        deaths = res.get('death')
+                        specials = res.get('special')
+                    paint = target_player.get('paint')
+        tag = tags_map.get((account, match_key))
+        rows.append((
+            played_time,
+            rule_name,
+            rule_raw,
+            stage,
+            judgement,
+            knockout,
+            duration,
+            my_player_count,
+            opponent_counts,
+            weapon,
+            kills,
+            assists,
+            deaths,
+            specials,
+            paint,
+            tag,
+            match_key,
+        ))
+    return rows
 
 def _salmon_rows(db,view):
     sql=f'''SELECT played_time,rule_raw,stage,danger_rate,result_wave,match_key FROM {view} ORDER BY played_time,match_key'''
-    return [SALMON_HEADERS]+[tuple(row) for row in db.execute(sql)]
+    return [SALMON_HEADERS]+[(r[0],format_rule(r[1]),r[2],r[3]*100 if r[3] is not None else None,r[4],r[5]) for r in db.execute(sql)]
 
 def _hold_rows(db):
     sql='''SELECT kind,genre,mode_raw,rule_raw,roster_class,match_key FROM analysis_hold ORDER BY kind,match_key'''
@@ -92,26 +142,30 @@ def export_xlsx(store,destination):
         ('セルを編集してもデータベースには戻りません。',),
         ('シートをまたいで集計しないでください。',),
         ('原文の応答は Excel のセルに入らないため、ここには入れていません。',),
-        ('プラベの2対2を、自動でイカップルとは記録していません。',),
+        ('プライベートマッチの2対2を、自動でイカップルとは記録していません。',),
     ]))]
     counts['説明']=5
     for name,view,kind in SHEETS:
         rows=_rows(store.db,kind,view)
         sheets.append((name,_sheet(rows)))
         counts[name]=max(0,len(rows)-1)
-    tmp=destination.with_suffix(destination.suffix+'.tmp')
-    with zipfile.ZipFile(tmp,'w',compression=zipfile.ZIP_DEFLATED) as z:
-        z.writestr('[Content_Types].xml',f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    fd,name=tempfile.mkstemp(prefix=destination.name+'.',suffix='.tmp',dir=destination.parent)
+    os.close(fd);tmp=Path(name)
+    try:
+        with zipfile.ZipFile(tmp,'w',compression=zipfile.ZIP_DEFLATED) as z:
+            z.writestr('[Content_Types].xml',f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="{NS_CT}"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>{''.join(f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' for i in range(1,len(sheets)+1))}</Types>''')
-        z.writestr('_rels/.rels',f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            z.writestr('_rels/.rels',f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="{NS_PKG}"><Relationship Id="rId1" Type="{NS_REL}/officeDocument" Target="xl/workbook.xml"/></Relationships>''')
-        workbook_sheets=''.join(f'<sheet name="{escape(name)}" sheetId="{i}" r:id="rId{i}"/>' for i, (name,_) in enumerate(sheets,1))
-        z.writestr('xl/workbook.xml',f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            workbook_sheets=''.join(f'<sheet name="{escape(name)}" sheetId="{i}" r:id="rId{i}"/>' for i, (name,_) in enumerate(sheets,1))
+            z.writestr('xl/workbook.xml',f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="{NS_MAIN}" xmlns:r="{NS_REL}"><sheets>{workbook_sheets}</sheets></workbook>''')
-        rels=''.join(f'<Relationship Id="rId{i}" Type="{NS_REL}/worksheet" Target="worksheets/sheet{i}.xml"/>' for i in range(1,len(sheets)+1))
-        z.writestr('xl/_rels/workbook.xml.rels',f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            rels=''.join(f'<Relationship Id="rId{i}" Type="{NS_REL}/worksheet" Target="worksheets/sheet{i}.xml"/>' for i in range(1,len(sheets)+1))
+            z.writestr('xl/_rels/workbook.xml.rels',f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="{NS_PKG}">{rels}</Relationships>''')
-        for i,(_,xml) in enumerate(sheets,1):z.writestr(f'xl/worksheets/sheet{i}.xml',xml)
-    tmp.replace(destination)
+            for i,(_,xml) in enumerate(sheets,1):z.writestr(f'xl/worksheets/sheet{i}.xml',xml)
+        tmp.replace(destination)
+    finally:
+        tmp.unlink(missing_ok=True)
     destination.chmod(0o600)
     return {'path':str(destination),'rows':counts,'canonical':'sqlite','edits_return_to_database':False}

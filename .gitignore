@@ -11,3 +11,8 @@ data/
 !config/*.example.json
 docs/research/downloads/
 .DS_Store
+
+# Local handoff transcript contains private session and memory records.
+docs/codex_fugu_session_20260924.md
+# Local continuation ledger stays on this workstation.
+docs/operations/astra-continuation-20260925.md

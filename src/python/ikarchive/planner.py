@@ -4,6 +4,10 @@ import base64
 EXCLUDED = {
     'ConfigureAnalyticsQuery': 'Analytics configuration is not a recorded play result.',
     'useShareMyOutfitQuery': 'Creates a share rendering; recorded outfit data is fetched separately.',
+    'VsHistoryDetailPagerRefetchQuery': (
+        'Its seven selected fields are a strict subset of VsHistoryDetailQuery; '
+        'the full detail response already preserves them.'
+    ),
 }
 
 def walk(value, path=()):

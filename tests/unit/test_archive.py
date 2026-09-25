@@ -22,8 +22,9 @@ class ArchiveTests(unittest.TestCase):
     def ingest(self,op,body,**kwargs):
         e=response(op,body,**kwargs);i=self.store.record(e);self.store.project(i,self.p);return i
     def test_current_catalog_exhaustively_classified(self):
-        self.assertEqual(len(self.p.queries),113);self.assertEqual(len(self.p.routes),104);self.assertFalse(self.p.unsupported)
+        self.assertEqual(len(self.p.queries),113);self.assertEqual(len(self.p.routes),103);self.assertFalse(self.p.unsupported)
         self.assertEqual(set(self.p.queries),set(self.p.routes)|set(self.p.excluded))
+        self.assertIn('VsHistoryDetailPagerRefetchQuery',self.p.excluded)
         for n in self.p.routes:self.assertEqual(self.p.queries[n]['params']['operationKind'],'query')
         for n in ['WeaponQuery','SideOrderRecordQuery','EventBattleHistoriesQuery','WeaponHistory_PaginationQuery']:
             self.assertIn(n,self.p.routes)
@@ -62,6 +63,22 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM pending_details').fetchone()[0],1)
         self.assertEqual(self.store.db.execute('SELECT state FROM jobs WHERE operation=?',('CoopHistoryDetailQuery',)).fetchone()[0],'retry')
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM documents').fetchone()[0],1)
+    def test_nullable_root_outcomes_are_not_false_failures(self):
+        self.store.queue('account-a','useCurrentFestQuery',{})
+        self.ingest('useCurrentFestQuery',{'data':{'currentFest':None}})
+        self.assertEqual(self.store.db.execute("SELECT state FROM jobs WHERE operation='useCurrentFestQuery'").fetchone()[0],'done')
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM issues WHERE code='INCOMPLETE_RESPONSE'").fetchone()[0],0)
+
+        rid=encoded('VsHistoryDetail-u-demo:REGULAR:20260901T010101_missing')
+        variables={'vsResultId':rid}
+        self.store.db.execute("INSERT INTO matches VALUES(?,?,?,?,?,NULL)",
+            ('account-a','vs','u-demo:20260901T010101_missing',now(),now()))
+        self.store.queue('account-a','VsHistoryDetailQuery',variables,'vs','u-demo:20260901T010101_missing')
+        self.ingest('VsHistoryDetailQuery',{'data':{'vsHistoryDetail':None}},variables=variables)
+        self.assertEqual(self.store.db.execute("SELECT state FROM jobs WHERE operation='VsHistoryDetailQuery'").fetchone()[0],'unavailable')
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM issues WHERE code='DETAIL_UNAVAILABLE'").fetchone()[0],1)
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM pending_details').fetchone()[0],0)
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM unavailable_details').fetchone()[0],1)
     def test_non_json_http_failure_preserved(self):
         e=response('LatestBattleHistoriesQuery',b'<html>maintenance</html>',status=503)
         i=self.store.record(e);self.store.project(i,self.p)
@@ -110,6 +127,16 @@ class ArchiveTests(unittest.TestCase):
         self.assertIn('new',self.store.db.execute('SELECT json_text FROM match_details').fetchone()[0])
         last=self.store.db.execute("SELECT r.fetched_at FROM jobs j JOIN responses r ON r.id=j.last_response_id WHERE j.operation='VsHistoryDetailQuery'").fetchone()[0]
         self.assertEqual(last,'2026-09-22T00:00:00Z')
+    def test_content_reversion_advances_endpoint_head(self):
+        values=[]
+        for day,label in [('20','A'),('21','B'),('22','A')]:
+            e=response('HistoryRecordQuery',{'data':{'playHistory':{'label':label}}})
+            e['fetched_at']='2026-09-'+day+'T00:00:00Z'
+            rid=self.store.record(e);self.store.project(rid,self.p);values.append(rid)
+        self.assertEqual(values[0],values[2])
+        self.assertNotEqual(values[0],values[1])
+        head=self.store.db.execute("SELECT response_id FROM endpoint_heads WHERE operation='HistoryRecordQuery'").fetchone()[0]
+        self.assertEqual(head,values[0])
     def test_missing_selected_field_is_not_silent(self):
         q={'queries':{'Q':{'params':{'operationKind':'query','id':'abc'},'operation':{'argumentDefinitions':[],'selections':[{'kind':'LinkedField','name':'record','alias':None,'concreteType':'Record','selections':[{'kind':'ScalarField','name':'required','alias':None}]}]}}}}
         p=Planner(q);self.store.queue('account-a','Q',{})

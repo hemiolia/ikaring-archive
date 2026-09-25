@@ -80,12 +80,39 @@ CREATE VIEW IF NOT EXISTS salmon_waves AS
  SELECT d.account,d.match_key,w.key wave_index,w.value json_text FROM match_details d,json_each(d.json_text,'$.waveResults') w WHERE d.kind='coop';
 CREATE VIEW IF NOT EXISTS salmon_bosses AS
  SELECT d.account,d.match_key,b.key boss_index,b.value json_text FROM match_details d,json_each(d.json_text,'$.enemyResults') b WHERE d.kind='coop';
-CREATE VIEW IF NOT EXISTS pending_details AS SELECT * FROM matches WHERE detail_response_id IS NULL;
+DROP VIEW IF EXISTS pending_details;
+DROP VIEW IF EXISTS unavailable_details;
+CREATE VIEW pending_details AS
+ SELECT m.* FROM matches m
+ WHERE m.detail_response_id IS NULL
+ AND EXISTS(
+  SELECT 1 FROM jobs j
+  WHERE j.account=m.account AND j.match_key=m.match_key AND j.state IN ('pending','retry')
+ );
+CREATE VIEW unavailable_details AS
+ SELECT m.* FROM matches m
+ WHERE m.detail_response_id IS NULL
+ AND EXISTS(
+  SELECT 1 FROM jobs j
+  WHERE j.account=m.account AND j.match_key=m.match_key AND j.state='unavailable'
+ )
+ AND NOT EXISTS(
+  SELECT 1 FROM jobs j
+  WHERE j.account=m.account AND j.match_key=m.match_key AND j.state IN ('pending','retry')
+ );
 CREATE TABLE IF NOT EXISTS entities(account TEXT NOT NULL,typename TEXT NOT NULL,entity_id TEXT NOT NULL,response_id INTEGER NOT NULL REFERENCES responses(id),json_text TEXT NOT NULL,PRIMARY KEY(account,typename,entity_id));
 CREATE TABLE IF NOT EXISTS page_fingerprints(account TEXT NOT NULL,operation TEXT NOT NULL,binding TEXT NOT NULL,field_path TEXT NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(account,operation,binding,field_path,sha256));
 CREATE TABLE IF NOT EXISTS assets(url TEXT PRIMARY KEY,state TEXT NOT NULL DEFAULT 'pending',body_sha256 TEXT REFERENCES bodies(sha256),content_type TEXT,attempts INTEGER NOT NULL DEFAULT 0,next_attempt REAL NOT NULL DEFAULT 0,last_error TEXT);
 CREATE TABLE IF NOT EXISTS asset_refs(response_id INTEGER NOT NULL REFERENCES responses(id),url TEXT NOT NULL REFERENCES assets(url),path TEXT NOT NULL,PRIMARY KEY(response_id,path));
 CREATE TABLE IF NOT EXISTS manifests(sha256 TEXT PRIMARY KEY,fetched_at TEXT NOT NULL,json_text TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS response_fetches(
+ event_id TEXT PRIMARY KEY,response_id INTEGER NOT NULL REFERENCES responses(id),
+ run_id INTEGER REFERENCES runs(id),fetched_at TEXT NOT NULL,headers_json TEXT NOT NULL,
+ acknowledged INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS response_fetches_response ON response_fetches(response_id,fetched_at);
+INSERT OR IGNORE INTO response_fetches(event_id,response_id,run_id,fetched_at,headers_json,acknowledged)
+ SELECT event_id,id,run_id,fetched_at,headers_json,projected FROM responses;
 DROP VIEW IF EXISTS analysis_private_four_vs_four_tags;
 DROP VIEW IF EXISTS analysis_private_one_vs_one_tags;
 DROP VIEW IF EXISTS analysis_private_other_tags;

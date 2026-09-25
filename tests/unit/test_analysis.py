@@ -147,20 +147,20 @@ class AnalysisTests(unittest.TestCase):
         result = export_xlsx(self.store, path)
         self.assertFalse(result['edits_return_to_database'])
         self.assertEqual(result['canonical'], 'sqlite')
-        self.assertEqual(result['rows']['オープン'], 1)
+        self.assertEqual(result['rows']['バンカラマッチ（オープン）'], 1)
         self.assertEqual(result['rows']['Xマッチ'], 1)
-        self.assertEqual(result['rows']['プラベ2対2'], 1)
+        self.assertEqual(result['rows']['プライベートマッチ（2対2）'], 1)
         with zipfile.ZipFile(path) as book:
             workbook = book.read('xl/workbook.xml').decode()
             names = [part.split('"', 1)[0] for part in workbook.split('name="')[1:]]
             texts = {name: book.read(f'xl/worksheets/sheet{index}.xml').decode() for index, name in enumerate(names, 1)}
-        self.assertIn('openxlsx', texts['オープン'])
+        self.assertIn('openxlsx', texts['バンカラマッチ（オープン）'])
         self.assertNotIn('openxlsx', texts['Xマッチ'])
         self.assertIn('xxlsx', texts['Xマッチ'])
-        self.assertNotIn('xxlsx', texts['オープン'])
-        self.assertIn('pairxlsx', texts['プラベ2対2'])
-        self.assertNotIn('pairxlsx', texts['プラベ4対4'])
-        self.assertNotIn('イカップル', texts['プラベ2対2'])
+        self.assertNotIn('xxlsx', texts['バンカラマッチ（オープン）'])
+        self.assertIn('pairxlsx', texts['プライベートマッチ（2対2）'])
+        self.assertNotIn('pairxlsx', texts['プライベートマッチ（4対4）'])
+        self.assertNotIn('イカップル', texts['プライベートマッチ（2対2）'])
         for xml in texts.values():
             self.assertNotIn('json_text', xml)
             for text in re.findall(r'<t xml:space="preserve">(.*?)</t>', xml):
@@ -207,18 +207,18 @@ class AnalysisTests(unittest.TestCase):
         labels = {row[0] for row in self.store.db.execute('SELECT label FROM rate_points')}
         self.assertIn('ブキチャレパワー', labels)
         self.assertIn('バンカラパワー', labels)
-        self.assertIn('直前のXパワー', labels)
+        self.assertIn('Xパワー', labels)
         self.assertIn('surprisePower', labels)
         self.assertNotIn('kill', {row[0] for row in self.store.db.execute("SELECT series_id FROM rate_points")})
-        self.assertEqual(self.store.db.execute("SELECT value FROM rate_points WHERE label='キンシャケ納品数'").fetchone()[0], 40)
-        self.assertEqual(self.store.db.execute("SELECT priority FROM rate_points WHERE label='バイトレート'").fetchone()[0], 'secondary')
-        self.assertEqual([row[0] for row in self.store.db.execute("SELECT value FROM rate_points WHERE label='チョーシ' ORDER BY played_time")], [1, 2, -1])
+        self.assertEqual(self.store.db.execute("SELECT value FROM rate_points WHERE label='集めた金イクラ'").fetchone()[0], 40)
+        self.assertEqual(self.store.db.execute("SELECT priority FROM rate_points WHERE label='評価レート'").fetchone()[0], 'secondary')
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM rate_points WHERE source='derived_judgement'").fetchone()[0], 0)
         from ikarchive.gui import write_gui
         page = Path(self.tmp.name) / 'index.html'
         write_gui(self.store, page)
         text = page.read_text(encoding='utf-8')
         self.assertIn('ブキチャレパワー', text)
-        self.assertIn('チョーシ', text)
+        self.assertNotIn('チョーシ', text)
         self.assertIn('surprisePower', text)
         self.assertIn(FIELD, text)
         self.assertIn('<table>', text)
@@ -258,16 +258,16 @@ class AnalysisTests(unittest.TestCase):
         html_no_font = page_no_font.read_text(encoding='utf-8')
 
         self.assertNotIn('@font-face', html_no_font)
-        self.assertIn('system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', html_no_font)
+        self.assertIn('system-ui, "Hiragino Kaku Gothic ProN", "Yu Gothic", Meiryo, sans-serif', html_no_font)
         self.assertFalse(re.search(r'(?<!sans-)serif\b', html_no_font), 'Standalone serif found in HTML')
 
     def test_gui_graph_elements_and_series_summary(self):
         from ikarchive.gui import write_gui
-        # 複数点系列 (チョーシ): -1, 1, 2
-        for suffix, when in (('a', '2026-09-22T03:00:00Z'), ('b', '2026-09-22T03:01:00Z'), ('c', '2026-09-22T03:02:00Z')):
-            detail = vs_detail('REGULAR', 'form_ui_' + suffix, (4, 4), rule='TURF_WAR')
+        # 複数点系列 (バンカラパワーで0を跨ぐ複数点): -10, 0, 10
+        for suffix, when, val in (('a', '2026-09-22T03:00:00Z', -10), ('b', '2026-09-22T03:01:00Z', 0), ('c', '2026-09-22T03:02:00Z', 10)):
+            detail = vs_detail('BANKARA', 'multi_ui_' + suffix, (4, 4), bankara='CHALLENGE', rule='AREA')
             detail['playedTime'] = when
-            detail['judgement'] = 'WIN' if suffix != 'c' else 'LOSE'
+            detail['bankaraMatch'] = {'mode': 'CHALLENGE', 'bankaraPower': {'power': val}}
             self.ingest('VsHistoryDetailQuery', {'data': {'vsHistoryDetail': detail}})
 
         # 1点だけの系列 (surprisePower)
@@ -286,13 +286,13 @@ class AnalysisTests(unittest.TestCase):
         write_gui(self.store, page)
         html_text = page.read_text(encoding='utf-8')
 
-        # 最新値・直前からの増減・最小・最大・点数の表示検査
+        # 最新値・直前からの増減・最低・最高・点数の表示検査
         self.assertIn('最新値', html_text)
         self.assertIn('直前からの増減', html_text)
-        self.assertIn('最小', html_text)
-        self.assertIn('最大', html_text)
+        self.assertIn('最低', html_text)
+        self.assertIn('最高', html_text)
         self.assertIn('点数', html_text)
-        self.assertIn('ナワバリ / チョーシ', html_text)
+        self.assertIn('バンカラマッチ（チャレンジ） / ガチエリア / バンカラパワー', html_text)
 
         # 1点だけの系列では増減が「—」であること
         self.assertIn('—', html_text)

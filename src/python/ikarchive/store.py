@@ -4,15 +4,30 @@ from pathlib import Path
 from urllib.parse import urlparse
 from .planner import walk, identity, decoded_id
 from .classify import classify_detail, classify_coop
-from .rates import observations, turf_form
+from .rates import observations, weapon_snapshots
 
 def now():return datetime.now(timezone.utc).isoformat()
 def js(value):return json.dumps(value,ensure_ascii=False,separators=(',',':'),sort_keys=True)
 def digest(body):return hashlib.sha256(body).hexdigest()
 
+DETAIL_ROOTS={
+    'VsHistoryDetailQuery':'vsHistoryDetail',
+    'CoopHistoryDetailQuery':'coopHistoryDetail',
+}
+EXPECTED_NULL_ROOTS={
+    'useCurrentFestQuery':'currentFest',
+}
+
 class Store:
-    def __init__(self,path):
+    def __init__(self,path,readonly=False):
         self.path=Path(path);self.output_root=self.path.parent.parent if self.path.parent.name=='database' else self.path.parent
+        self.readonly=readonly
+        if readonly:
+            if not self.path.is_file():raise FileNotFoundError(f'Database not found: {self.path}')
+            self.db=sqlite3.connect(f'{self.path.resolve().as_uri()}?mode=ro',uri=True,timeout=30)
+            self.db.row_factory=sqlite3.Row
+            self.db.execute('PRAGMA query_only=ON')
+            return
         self.path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
         self.db=sqlite3.connect(path,timeout=30);self.db.row_factory=sqlite3.Row
         self.db.execute('PRAGMA journal_mode=WAL');self.db.execute('PRAGMA synchronous=FULL')
@@ -31,22 +46,31 @@ class Store:
         with self.db:
             self.db.execute('INSERT OR IGNORE INTO bodies VALUES(?,?,?)',(sha,raw,len(raw)))
             variables=js(e['variables'])
-            existing=self.db.execute('SELECT id FROM responses WHERE account=? AND operation=? AND variables_json=? AND body_sha256=?',(e['account'],e['operation'],variables,sha)).fetchone()
-            if existing:return existing[0]
-            self.db.execute('''INSERT OR IGNORE INTO responses(event_id,run_id,account,fetched_at,operation,variables_json,query_id,app_version,http_status,headers_json,body_sha256,json_text,parse_error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',(e['event_id'],run,e['account'],e['fetched_at'],e['operation'],variables,e.get('query_id'),e.get('app_version'),e.get('status'),js(e.get('headers',{})),sha,text,error))
-        return self.db.execute('SELECT id FROM responses WHERE event_id=?',(e['event_id'],)).fetchone()[0]
+            existing=self.db.execute('SELECT id FROM responses WHERE account=? AND operation=? AND variables_json=? AND body_sha256=? AND http_status IS ? AND query_id IS ? AND app_version IS ?',
+                (e['account'],e['operation'],variables,sha,e.get('status'),e.get('query_id'),e.get('app_version'))).fetchone()
+            if existing:rid=existing[0]
+            else:
+                self.db.execute('''INSERT OR IGNORE INTO responses(event_id,run_id,account,fetched_at,operation,variables_json,query_id,app_version,http_status,headers_json,body_sha256,json_text,parse_error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',(e['event_id'],run,e['account'],e['fetched_at'],e['operation'],variables,e.get('query_id'),e.get('app_version'),e.get('status'),js(e.get('headers',{})),sha,text,error))
+                rid=self.db.execute('SELECT id FROM responses WHERE event_id=?',(e['event_id'],)).fetchone()[0]
+            self.db.execute('INSERT OR IGNORE INTO response_fetches(event_id,response_id,run_id,fetched_at,headers_json) VALUES(?,?,?,?,?)',
+                (e['event_id'],rid,run,e['fetched_at'],js(e.get('headers',{}))))
+        return rid
     def project(self,rid,planner,country='JP'):
         r=self.db.execute('SELECT * FROM responses WHERE id=?',(rid,)).fetchone()
-        if r['projected']:return
+        if r['projected']:
+            self._acknowledge_fetches(r,planner)
+            return
         obj=json.loads(r['json_text']) if r['json_text'] else {}
         op=r['operation'];account=r['account'];variables=json.loads(r['variables_json']);data=obj.get('data') if isinstance(obj,dict) else None
-        okay=r['http_status']==200 and isinstance(data,dict) and not obj.get('errors')
-        if isinstance(data,dict) and not any(v is not None for v in data.values()):okay=False
         omissions=planner.missing_fields(op,data,variables) if r['query_id'] and isinstance(data,dict) and op in planner.routes else []
-        if omissions:okay=False
+        outcome=self._response_outcome(r,obj,data,omissions)
+        okay=outcome=='done'
         with self.db:
             for path in omissions:self.issue('SELECTED_FIELD_MISSING',{'operation':op,'path':path},rid)
-            if not okay:self.issue('INCOMPLETE_RESPONSE',{'operation':op,'status':r['http_status'],'graphql_errors':bool(obj.get('errors')) if isinstance(obj,dict) else False},rid)
+            if outcome=='retry':
+                self.issue('INCOMPLETE_RESPONSE',{'operation':op,'status':r['http_status'],'graphql_errors':bool(obj.get('errors')) if isinstance(obj,dict) else False},rid)
+            elif outcome=='unavailable':
+                self.issue('DETAIL_UNAVAILABLE',{'operation':op,'reason':'SERVER_RETURNED_NULL'},rid)
             if isinstance(data,dict):
                 self._matches(r,data,okay)
                 if okay and ('Histories' in op or op=='CoopHistoryQuery'):
@@ -80,10 +104,65 @@ class Store:
                             self.queue(account,a,b)
                         elif event=='issue':self.issue(a,b,rid)
                 else:self.issue('UNKNOWN_OPERATION',op,rid)
-            if okay:
-                self.db.execute('INSERT INTO endpoint_heads VALUES(?,?,?) ON CONFLICT(account,operation) DO UPDATE SET response_id=excluded.response_id WHERE (SELECT fetched_at FROM responses WHERE id=excluded.response_id)>=(SELECT fetched_at FROM responses WHERE id=endpoint_heads.response_id)',(account,op,rid))
+            if okay:self._advance_endpoint_head(r,r['fetched_at'])
             self.db.execute('UPDATE responses SET projected=1 WHERE id=?',(rid,))
-            self.db.execute('UPDATE jobs SET state=?,attempts=attempts+1,next_attempt=?,last_response_id=? WHERE account=? AND operation=? AND variables_json=? AND (last_response_id IS NULL OR (SELECT fetched_at FROM responses WHERE id=last_response_id)<=?)',('done' if okay else 'retry',time.time()+(86400 if okay else 300),rid,account,op,r['variables_json'],r['fetched_at']))
+            self._acknowledge_fetches(r,planner)
+    def _response_outcome(self,r,obj,data,omissions=()):
+        if r['http_status']!=200 or not isinstance(data,dict) or obj.get('errors') or omissions:
+            return 'retry'
+        operation=r['operation']
+        root=DETAIL_ROOTS.get(operation)
+        if root and data.get(root) is None:
+            return 'unavailable'
+        root=EXPECTED_NULL_ROOTS.get(operation)
+        if root and root in data and data.get(root) is None:
+            return 'done'
+        if not data or not any(v is not None for v in data.values()):
+            return 'retry'
+        return 'done'
+    def _advance_endpoint_head(self,r,fetched_at):
+        current=self.db.execute('SELECT response_id FROM endpoint_heads WHERE account=? AND operation=?',(r['account'],r['operation'])).fetchone()
+        replace=current is None
+        if current:
+            last=self.db.execute('''SELECT COALESCE(MAX(julianday(fetched_at)),
+                (SELECT julianday(fetched_at) FROM responses WHERE id=?))
+                FROM response_fetches WHERE response_id=?''',(current[0],current[0])).fetchone()[0]
+            candidate=self.db.execute('SELECT julianday(?)',(fetched_at,)).fetchone()[0]
+            replace=candidate is not None and (last is None or candidate>=last)
+        if replace:
+            self.db.execute('INSERT INTO endpoint_heads VALUES(?,?,?) ON CONFLICT(account,operation) DO UPDATE SET response_id=excluded.response_id',
+                (r['account'],r['operation'],r['id']))
+    def _acknowledge_fetches(self,r,planner):
+        """本文の投影と、再取得の完了処理を分離する。スプール再生は冪等。"""
+        obj=json.loads(r['json_text']) if r['json_text'] else {}
+        data=obj.get('data') if isinstance(obj,dict) else None
+        omissions=planner.missing_fields(r['operation'],data,json.loads(r['variables_json'])) if r['query_id'] and isinstance(data,dict) and r['operation'] in planner.routes else []
+        outcome=self._response_outcome(r,obj,data,omissions)
+        okay=outcome=='done'
+        with self.db:
+            fetches=self.db.execute('SELECT * FROM response_fetches WHERE response_id=? AND acknowledged=0 ORDER BY julianday(fetched_at),event_id',(r['id'],)).fetchall()
+            for fetched in fetches:
+                if okay and r['operation'] in ('WeaponQuery','WeaponCollectionRefetchQuery'):
+                    self._write_weapon_snapshots(r,data,fetched['fetched_at'],fetched['event_id'])
+                # A delayed spool receipt must not undo a more recent success/failure.
+                latest=self.db.execute('''SELECT MAX(julianday(f.fetched_at)) FROM response_fetches f JOIN responses p ON p.id=f.response_id
+                    WHERE p.account=? AND p.operation=? AND p.variables_json=? AND f.acknowledged=1''',
+                    (r['account'],r['operation'],r['variables_json'])).fetchone()[0]
+                at=self.db.execute('SELECT julianday(?)',(fetched['fetched_at'],)).fetchone()[0]
+                if latest is None or (at is not None and at>=latest):
+                    if okay and r['projected']:
+                        # A -> B -> A is a new observation of an old body. It must become
+                        # current again without losing B or duplicating the match.
+                        self._matches({**dict(r),'fetched_at':fetched['fetched_at']},data,True)
+                    if okay:self._advance_endpoint_head(r,fetched['fetched_at'])
+                    self.db.execute('UPDATE jobs SET state=?,attempts=attempts+1,next_attempt=?,last_response_id=? WHERE account=? AND operation=? AND variables_json=?',
+                        (outcome,time.time()+(86400 if outcome in ('done','unavailable') else 300),r['id'],r['account'],r['operation'],r['variables_json']))
+                self.db.execute('UPDATE response_fetches SET acknowledged=1 WHERE event_id=?',(fetched['event_id'],))
+    def _write_weapon_snapshots(self,r,data,fetched_at,event_id):
+        for item in weapon_snapshots(data):
+            self.db.execute('''INSERT INTO rate_points(account,series_id,label,genre,rule_raw,match_key,played_time,value,source,priority)
+                VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account,series_id,match_key) DO UPDATE SET label=excluded.label,value=excluded.value''',
+                (r['account'],item['series_id'],item['label'],item['genre'],item['rule_raw'],'fetch:'+event_id,fetched_at,item['value'],'api_snapshot','primary'))
     def _matches(self,r,data,okay):
         for path,v in walk(data):
             if not isinstance(v,dict) or not isinstance(v.get('id'),str):continue
@@ -98,7 +177,9 @@ class Store:
             full=(r['operation']=='VsHistoryDetailQuery' and kind=='vs' and len(path)==1) or (r['operation']=='CoopHistoryDetailQuery' and kind=='coop' and len(path)==1)
             if full:
                 self.db.execute('INSERT OR IGNORE INTO documents VALUES(?,?,?,?,?)',(r['id'],a,kind,key,js(v)))
-                if okay:self.db.execute('UPDATE matches SET detail_response_id=? WHERE account=? AND kind=? AND match_key=? AND (detail_response_id IS NULL OR (SELECT fetched_at FROM responses WHERE id=detail_response_id)<=?)',(r['id'],a,kind,key,r['fetched_at']))
+                if okay:self.db.execute('''UPDATE matches SET detail_response_id=? WHERE account=? AND kind=? AND match_key=? AND
+                    (detail_response_id IS NULL OR COALESCE((SELECT MAX(julianday(fetched_at)) FROM response_fetches WHERE response_id=detail_response_id),
+                    (SELECT julianday(fetched_at) FROM responses WHERE id=detail_response_id))<=julianday(?))''',(r['id'],a,kind,key,r['fetched_at']))
                 if kind in ('vs','coop'):
                     self._write_classification(a,kind,key)
                     self._write_rates(a,kind,key)
@@ -116,7 +197,8 @@ class Store:
             e=json.loads(f.read_text());rid=self.record(e,run);self.project(rid,planner);f.unlink()
         for r in self.db.execute('SELECT id FROM responses WHERE projected=0').fetchall():self.project(r[0],planner)
     def status(self):
-        counts={t:self.db.execute('SELECT count(*) FROM '+t).fetchone()[0] for t in ('responses','matches','documents','pending_details','issues','entities','assets')}
+        counts={t:self.db.execute('SELECT count(*) FROM '+t).fetchone()[0] for t in ('responses','matches','documents','pending_details','unavailable_details','issues','entities','assets')}
+        counts['matches_without_detail']=self.db.execute('SELECT count(*) FROM matches WHERE detail_response_id IS NULL').fetchone()[0]
         counts['jobs']=[dict(r) for r in self.db.execute('SELECT state,count(*) count FROM jobs GROUP BY state')]
         counts['assets_by_state']=[dict(r) for r in self.db.execute('SELECT state,count(*) count FROM assets GROUP BY state')]
         counts['last_run']=dict(r) if (r:=self.db.execute('SELECT * FROM runs ORDER BY id DESC LIMIT 1').fetchone()) else None
@@ -124,7 +206,37 @@ class Store:
         counts['tags']=[dict(r) for r in self.db.execute('SELECT tag,count(*) count FROM match_tags GROUP BY tag ORDER BY tag')]
         counts['all_server_records_verified']=False
         counts['auth']=self.auth_status()
+        counts['sync_health']=self.sync_health()
+        counts['storage_health']=counts['sync_health']['storage_health']
         return counts
+    def sync_health(self):
+        from .collector import HISTORIES
+        from .storage import storage_health
+        receipts=bool(self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='response_fetches'").fetchone())
+        clocks=[]
+        for operation in sorted(HISTORIES):
+            source='response_fetches f JOIN responses r ON r.id=f.response_id' if receipts else 'responses r'
+            stamp='f.fetched_at' if receipts else 'r.fetched_at'
+            row=self.db.execute(f'''SELECT {stamp} FROM {source} WHERE r.operation=? AND r.http_status=200 AND r.projected=1
+                AND NOT EXISTS(SELECT 1 FROM issues i WHERE i.response_id=r.id AND i.code IN ('INCOMPLETE_RESPONSE','SELECTED_FIELD_MISSING'))
+                ORDER BY julianday({stamp}) DESC LIMIT 1''',(operation,)).fetchone()
+            at=row[0] if row else None
+            age=None
+            if at:
+                try:age=max(0,(datetime.now(timezone.utc)-datetime.fromisoformat(at.replace('Z','+00:00'))).total_seconds())
+                except ValueError:pass
+            clocks.append({'operation':operation,'last_success_at':at,'age_seconds':round(age,1) if age is not None else None,'stale':age is None or age>600})
+        stale=any(c['stale'] for c in clocks)
+        pause=self._control('retry_after')
+        if pause:
+            try:
+                if float(pause)<=time.time():pause=None
+            except ValueError:
+                pause=None
+        return {'state':'delayed' if stale else 'current','stale_after_seconds':600,'histories':clocks,
+            'storage_health':storage_health(self.path),'auth':self.auth_status(),
+            'retry_after':datetime.fromtimestamp(float(pause),timezone.utc).isoformat() if pause else None,
+            'exports_updated_at':self._control('exports_updated_at'),'export_error':self._control('export_error')}
     def _control(self,key,value=None):
         if value is None:return (row[0] if (row:=self.db.execute('SELECT value FROM control WHERE key=?',(key,)).fetchone()) else None)
         self.db.execute('INSERT INTO control VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(key,value))
@@ -166,7 +278,7 @@ class Store:
             'last_failure':failure,
             'last_failure_at':self._control('auth_last_failure_at'),
             'last_sync_error':self._control('last_sync_error'),
-            'reauth_required':failure in ('AUTH_REQUIRED','SESSION_EXPIRED') and (not ok or (self._control('auth_last_failure_at') or '')>=(ok or '')),
+            'reauth_required':failure in ('AUTH_REQUIRED','AUTH_EXPIRED','SESSION_EXPIRED') and (not ok or (self._control('auth_last_failure_at') or '')>=(ok or '')),
             'session_expires_soon':remaining is not None and remaining<14*86400,
             'backfill_armed':self._control('backfill_armed')=='1',
         }
@@ -175,18 +287,118 @@ class Store:
         if self._control('backfill_armed')!='1' or self._control('backfill_reset_done')=='1':return 0
         with self.db:
             self._control('backfill_reset_done','1')
-            cur=self.db.execute('''UPDATE jobs SET state='pending',next_attempt=0 WHERE account=? AND state='done' AND (operation LIKE '%Histor%' OR operation='CoopHistoryQuery' OR (operation IN ('VsHistoryDetailQuery','CoopHistoryDetailQuery') AND match_key IN (SELECT match_key FROM matches WHERE account=? AND detail_response_id IS NULL)))''',(account,account))
+            cur=self.db.execute('''UPDATE jobs SET state='pending',next_attempt=0 WHERE account=? AND state IN ('done','unavailable') AND (operation LIKE '%Histor%' OR operation='CoopHistoryQuery' OR (operation IN ('VsHistoryDetailQuery','CoopHistoryDetailQuery') AND match_key IN (SELECT match_key FROM matches WHERE account=? AND detail_response_id IS NULL)))''',(account,account))
             return cur.rowcount
     def finish_backfill(self,account):
         if self._control('backfill_armed')!='1':return
-        pending=self.db.execute("SELECT count(*) FROM jobs WHERE account=? AND state!='done' AND (operation LIKE '%Histor%' OR operation='CoopHistoryQuery')",(account,)).fetchone()[0]
+        pending=self.db.execute("SELECT count(*) FROM jobs WHERE account=? AND state IN ('pending','retry') AND (operation LIKE '%Histor%' OR operation='CoopHistoryQuery')",(account,)).fetchone()[0]
         if pending==0:
             with self.db:self.db.execute("DELETE FROM control WHERE key IN ('backfill_armed','backfill_reset_done')")
     def _reclassify(self):
+        self._repair_job_outcomes()
+        # 旧実装の勝敗由来「チョーシ」は誤った派生値。原文・試合記録は保持。
+        self.db.execute("DELETE FROM rate_points WHERE source='derived_judgement'")
         for row in self.db.execute("SELECT account,kind,match_key FROM matches WHERE kind IN ('vs','coop') AND detail_response_id IS NOT NULL"):
             self._write_classification(row['account'],row['kind'],row['match_key'])
             self._write_rates(row['account'],row['kind'],row['match_key'])
+        for row in self.db.execute("SELECT * FROM responses WHERE operation IN ('WeaponQuery','WeaponCollectionRefetchQuery') AND http_status=200 AND json_text IS NOT NULL"):
+            obj=json.loads(row['json_text'])
+            if isinstance(obj,dict) and not obj.get('errors'):
+                for fetched in self.db.execute('SELECT event_id,fetched_at FROM response_fetches WHERE response_id=?',(row['id'],)):
+                    self._write_weapon_snapshots(row,obj.get('data'),fetched['fetched_at'],fetched['event_id'])
         self.db.commit()
+    def _repair_job_outcomes(self):
+        """旧版の誤った再試行状態を、保存済み原文から非破壊で再判定する。"""
+        with self.db:
+            pager_jobs = self.db.execute(
+                "SELECT account, operation, variables_json, state FROM jobs WHERE operation='VsHistoryDetailPagerRefetchQuery'"
+            ).fetchall()
+            for j in pager_jobs:
+                if j['state'] != 'superseded':
+                    self.db.execute(
+                        "UPDATE jobs SET state='superseded', next_attempt=? WHERE account=? AND operation=? AND variables_json=?",
+                        (time.time() + 86400, j['account'], j['operation'], j['variables_json'])
+                    )
+            self.db.execute(
+                "UPDATE issues SET code='SUPERSEDED_RESPONSE' WHERE code='INCOMPLETE_RESPONSE' AND response_id IN ("
+                "SELECT id FROM responses WHERE operation='VsHistoryDetailPagerRefetchQuery')"
+            )
+
+            row = self.db.execute("SELECT json_text FROM manifests ORDER BY fetched_at DESC LIMIT 1").fetchone()
+            planner = None
+            if row and row['json_text']:
+                from .planner import Planner
+                try:
+                    manifest = json.loads(row['json_text'])
+                    planner = Planner(manifest)
+                except Exception:
+                    planner = None
+
+            target_ops = {**EXPECTED_NULL_ROOTS, **DETAIL_ROOTS}
+            placeholders = ','.join('?' for _ in target_ops)
+            jobs = self.db.execute(
+                f"SELECT account, operation, variables_json, state, next_attempt, last_response_id FROM jobs "
+                f"WHERE operation IN ({placeholders}) AND last_response_id IS NOT NULL",
+                list(target_ops.keys())
+            ).fetchall()
+
+            for job in jobs:
+                op = job['operation']
+                root = target_ops[op]
+                rid = job['last_response_id']
+                r = self.db.execute("SELECT * FROM responses WHERE id=?", (rid,)).fetchone()
+                if not r or not r['json_text']:
+                    continue
+                try:
+                    obj = json.loads(r['json_text'])
+                except Exception:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                data = obj.get('data')
+                if not isinstance(data, dict) or root not in data or data[root] is not None:
+                    continue
+
+                try:
+                    variables = json.loads(r['variables_json'])
+                except Exception:
+                    variables = {}
+
+                if planner is None:
+                    if r['query_id']:
+                        continue
+                    omissions = ()
+                else:
+                    omissions = (
+                        planner.missing_fields(op, data, variables)
+                        if r['query_id'] and isinstance(data, dict) and op in planner.routes
+                        else []
+                    )
+
+                outcome = self._response_outcome(r, obj, data, omissions)
+
+                if job['state'] != outcome:
+                    next_attempt = time.time() + (86400 if outcome in ('done', 'unavailable') else 300)
+                    self.db.execute(
+                        "UPDATE jobs SET state=?, next_attempt=? WHERE account=? AND operation=? AND variables_json=?",
+                        (outcome, next_attempt, job['account'], job['operation'], job['variables_json'])
+                    )
+
+                if outcome == 'unavailable':
+                    self.db.execute(
+                        "UPDATE issues SET code='DETAIL_UNAVAILABLE' WHERE code='INCOMPLETE_RESPONSE' AND response_id=?",
+                        (rid,)
+                    )
+                elif outcome == 'done':
+                    self.db.execute(
+                        "UPDATE issues SET code='EXPECTED_ABSENCE' WHERE code='INCOMPLETE_RESPONSE' AND response_id=?",
+                        (rid,)
+                    )
+                else:
+                    self.db.execute(
+                        "UPDATE issues SET code='INCOMPLETE_RESPONSE' WHERE code IN ('DETAIL_UNAVAILABLE','EXPECTED_ABSENCE') AND response_id=?",
+                        (rid,)
+                    )
     def _write_classification(self,account,kind,key):
         row=self.db.execute('''SELECT d.json_text,m.detail_response_id FROM matches m
             JOIN documents d ON d.response_id=m.detail_response_id AND d.account=m.account AND d.kind=m.kind AND d.match_key=m.match_key
@@ -200,23 +412,17 @@ class Store:
             ON CONFLICT(account,kind,match_key) DO UPDATE SET genre=excluded.genre,mode_raw=excluded.mode_raw,bankara_mode=excluded.bankara_mode,rule_raw=excluded.rule_raw,rule_name=excluded.rule_name,roster_class=excluded.roster_class,analysis_set=excluded.analysis_set,team_count=excluded.team_count,my_player_count=excluded.my_player_count,opponent_counts=excluded.opponent_counts,detail_response_id=excluded.detail_response_id,classified_at=excluded.classified_at''',
             (account,kind,key,info['genre'],info['mode_raw'],info['bankara_mode'],info['rule_raw'],info['rule_name'],info['roster_class'],info['analysis_set'],info['team_count'],info['my_player_count'],js(info['opponent_counts']),row['detail_response_id'],now()))
     def _write_rates(self,account,kind,key):
-        row=self.db.execute('''SELECT d.json_text,c.genre,c.rule_raw,json_extract(d.json_text,'$.playedTime') played_time,json_extract(d.json_text,'$.judgement') judgement
+        row=self.db.execute('''SELECT d.json_text,c.genre,c.analysis_set,c.rule_raw,json_extract(d.json_text,'$.playedTime') played_time,json_extract(d.json_text,'$.judgement') judgement
             FROM match_classification c JOIN documents d ON d.response_id=c.detail_response_id AND d.account=c.account AND d.kind=c.kind AND d.match_key=c.match_key
             WHERE c.account=? AND c.kind=? AND c.match_key=?''',(account,kind,key)).fetchone()
         self.db.execute('DELETE FROM rate_points WHERE account=? AND match_key=? AND source=?',(account,key,'api'))
         if not row:return
         detail=json.loads(row['json_text'])
-        for item in observations(detail,row['genre'],row['rule_raw']):
+        genre=row['analysis_set'] if row['genre']=='private' else row['genre']
+        for item in observations(detail,genre,row['rule_raw']):
             self.db.execute('''INSERT INTO rate_points(account,series_id,label,genre,rule_raw,match_key,played_time,value,source,priority)
                 VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account,series_id,match_key) DO UPDATE SET label=excluded.label,value=excluded.value,played_time=excluded.played_time,priority=excluded.priority,source=excluded.source''',
                 (account,item['series_id'],item['label'],item['genre'],item['rule_raw'],key,row['played_time'],item['value'],item['source'],item['priority']))
-        if row['genre']=='nawabari':self._rebuild_turf_form(account)
-    def _rebuild_turf_form(self,account):
-        rows=self.db.execute('''SELECT a.match_key,a.played_time,a.judgement FROM analysis_nawabari a WHERE a.account=? ORDER BY a.played_time,a.match_key''',(account,)).fetchall()
-        self.db.execute("DELETE FROM rate_points WHERE account=? AND series_id='nawabari||form'",(account,))
-        for row,streak in zip(rows,turf_form(row['judgement'] for row in rows)):
-            self.db.execute('''INSERT INTO rate_points(account,series_id,label,genre,rule_raw,match_key,played_time,value,source,priority)
-                VALUES(?,?,?,?,?,?,?,?,?,?)''',(account,'nawabari||form','チョーシ','nawabari','TURF_WAR',row['match_key'],row['played_time'],streak,'derived_judgement','primary'))
     def verify(self):
         errors=[]
         if self.db.execute('PRAGMA integrity_check').fetchone()[0]!='ok':errors.append('integrity_check')

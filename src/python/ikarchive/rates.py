@@ -1,31 +1,32 @@
 """レート系の数値を試合から拾う。挙げられた指標だけの閉じた一覧にはしない。"""
 LABELS = {
     'weaponPower': 'ブキチャレパワー',
-    'lastXPower': '直前のXパワー',
-    'entireXPower': '全体のXパワー',
-    'xPowerAfter': '計測後のXパワー',
+    'lastXPower': 'Xパワー',
+    'entireXPower': 'Xパワー',
+    'xPowerAfter': 'Xパワー',
     'myLeaguePower': 'イベントパワー',
     'myFestPower': 'フェスパワー',
     'earnedUdemaePoint': 'ウデマエポイント増減',
-    'jobRate': 'バイトレート',
+    'jobRate': '評価レート',
     'jobScore': 'バイトスコア',
-    'jobPoint': 'バイトポイント',
+    'jobPoint': '獲得ポイント',
     'dangerRate': 'キケン度',
     'afterGradePoint': '評価ポイント',
-    'goldenDeliverCount': 'キンシャケ納品数',
-    'deliverCount': '納品数',
-    'teamDeliverCount': 'チーム納品数',
-    'teamDeliverCountSum': 'チーム納品数',
+    'goldenDeliverCount': '集めた金イクラ',
+    'deliverCount': '集めたイクラ',
+    'teamDeliverCount': '集めた金イクラ',
+    'teamDeliverCountSum': '集めた金イクラ',
     'rankPercentile': '順位の百分位',
-    'highestJobScore': '最高スコア',
+    'highestJobScore': 'ハイスコア',
     'highestGradePoint': '最高評価ポイント',
-    'maxBestNinePower': 'ベストナインパワー',
-    'maxWeaponPowerTotal': 'ブキパワー合計の最高',
+    'maxBestNinePower': 'ベストナイン合計パワー',
+    'maxWeaponPowerTotal': '最高ブキチャレパワー合計',
     'regularGradePoint': 'バイト評価ポイント',
     'gradePoint': '評価ポイント',
-    'limitedPoint': '限定ポイント',
-    'regularPoint': '通常ポイント',
-    'totalPoint': '累計ポイント',
+    'limitedPoint': '現在の期間限定ポイント',
+    'regularPoint': '現在のポイント',
+    'totalPoint': 'るいけいポイント',
+    'vibes': 'チョーシ',
 }
 SKIP_KEYS = {
     'kill', 'death', 'assist', 'special', 'paint', 'width', 'height', 'duration', 'order',
@@ -104,7 +105,7 @@ def observations(detail, genre, rule_raw):
     return found
 
 def turf_form(judgements):
-    """ナワバリのチョーシ。APIにその数値は無いので、勝敗の連なりから数える。"""
+    """連勝・連敗数。公式のチョーシ（Weapon.stats.vibes）とは異なる。"""
     streak = 0
     points = []
     for judgement in judgements:
@@ -116,3 +117,25 @@ def turf_form(judgements):
             streak = 0
         points.append(streak)
     return points
+
+def weapon_snapshots(data):
+    """本人のブキ記録のみ。ランキング内の他プレイヤーは走査しない。"""
+    found={}
+    if not isinstance(data,dict):return []
+    for root in ('weapons','weaponRecords','allWeapons'):
+        container=data.get(root)
+        nodes=container.get('nodes',[]) if isinstance(container,dict) else []
+        for weapon in nodes or []:
+            if not isinstance(weapon,dict) or not weapon.get('id'):continue
+            stats=weapon.get('stats')
+            if not isinstance(stats,dict):continue
+            wid=weapon['id'];name=weapon.get('name') or 'ブキ名未取得'
+            metrics=[('vibes',stats.get('vibes'),'チョーシ','nawabari'),
+                     ('maxWeaponPower',stats.get('maxWeaponPower'),'最高ブキチャレパワー','bankara_challenge')]
+            current=stats.get('currentWeaponPowerOrder')
+            if isinstance(current,dict):metrics.append(('weaponPower',current.get('weaponPower'),'ブキチャレパワー','bankara_challenge'))
+            for key,value,label,genre in metrics:
+                if isinstance(value,(int,float)) and not isinstance(value,bool):
+                    found[(wid,key)]={'series_id':genre+'|weapon:'+wid+'|'+key,'label':label+' / '+name,
+                        'genre':genre,'rule_raw':'TURF_WAR' if key=='vibes' else None,'value':float(value)}
+    return list(found.values())
